@@ -125,6 +125,82 @@ class FormatTests(unittest.TestCase):
         keys = [spec.key for spec in charts.CHART_SPECS]
         self.assertEqual(keys, ['us10y', 'cn10y', 'usdcny', 'xauusd', 'adv_ratio', 'hs300_20d'])
 
+    def test_sentiment_specs_exist(self):
+        keys = [spec.key for spec in charts.SENTIMENT_SPECS]
+        self.assertEqual(keys, ['sentiment_index', 'participation_index', 'direction_index'])
+        for spec in charts.SENTIMENT_SPECS:
+            with self.subTest(spec=spec.key):
+                self.assertEqual(spec.hline_values, (40.0, 60.0))
+
+
+class QuadrantFigureTests(unittest.TestCase):
+    """四象限图：四个象限底色 + 阈值线 + 最近 10 个交易日 + 箭头（过去 → 未来）。"""
+
+    @staticmethod
+    def _points(count: int = 20) -> list[tuple[date, float, float]]:
+        start = END - timedelta(days=count - 1)
+        return [
+            (start + timedelta(days=index), 20.0 + index * 3, 80.0 - index * 2)
+            for index in range(count)
+        ]
+
+    def test_figure_has_quadrants_thresholds_and_path(self):
+        points = self._points(20)
+        figure = charts.build_quadrant_figure(points)
+        # 4 个象限矩形 + 2 条阈值线
+        self.assertGreaterEqual(len(figure.layout.shapes), 6)
+        self.assertEqual(len(figure.data), 2)  # 交易日散点 + 最新点
+        self.assertEqual(len(figure.data[0].x), 10)  # 只保留最近 10 个交易日
+        self.assertEqual(figure.data[0].mode, 'markers')
+        self.assertEqual(list(figure.layout.xaxis.range), [0, 100])
+        self.assertEqual(list(figure.layout.yaxis.range), [0, 100])
+
+    def test_arrows_connect_consecutive_days_from_past_to_future(self):
+        points = self._points(20)
+        figure = charts.build_quadrant_figure(points)
+        arrows = [item for item in figure.layout.annotations if item.showarrow]
+        self.assertEqual(len(arrows), 9)  # 10 个点 -> 9 段箭头
+        recent = points[-10:]
+        for index, arrow in enumerate(arrows):
+            older, newer = recent[index], recent[index + 1]
+            with self.subTest(segment=index):
+                # 箭头终点 = 较新的点，起点 = 较旧的点
+                self.assertAlmostEqual(float(arrow.x), newer[1], places=9)
+                self.assertAlmostEqual(float(arrow.y), newer[2], places=9)
+                self.assertAlmostEqual(float(arrow.ax), older[1], places=9)
+                self.assertAlmostEqual(float(arrow.ay), older[2], places=9)
+
+    def test_labels_mark_oldest_and_latest(self):
+        points = self._points(12)
+        figure = charts.build_quadrant_figure(points)
+        texts = [str(item.text) for item in figure.layout.annotations if item.text]
+        self.assertTrue(any('最新' in text for text in texts))
+        self.assertTrue(any('9 个交易日前' in text for text in texts))
+
+    def test_max_points_is_configurable(self):
+        points = self._points(30)
+        figure = charts.build_quadrant_figure(points, max_points=3)
+        self.assertEqual(len(figure.data[0].x), 3)
+        arrows = [item for item in figure.layout.annotations if item.showarrow]
+        self.assertEqual(len(arrows), 2)
+
+    def test_single_point_has_no_arrow(self):
+        figure = charts.build_quadrant_figure(self._points(1))
+        arrows = [item for item in figure.layout.annotations if item.showarrow]
+        self.assertEqual(arrows, [])
+        self.assertEqual(len(figure.data[0].x), 1)
+
+    def test_empty_points_still_renders(self):
+        figure = charts.build_quadrant_figure([])
+        self.assertEqual(len(figure.data), 0)
+        self.assertGreaterEqual(len(figure.layout.shapes), 6)
+
+    def test_latest_point_is_highlighted(self):
+        points = self._points(5)
+        figure = charts.build_quadrant_figure(points)
+        self.assertEqual(list(figure.data[1].x), [points[-1][1]])
+        self.assertEqual(list(figure.data[1].y), [points[-1][2]])
+
 
 if __name__ == '__main__':
     unittest.main()

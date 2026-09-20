@@ -74,28 +74,38 @@ def build_jobs(
     today: date,
     full: bool,
     api_key: str | None,
+    years: int | None = None,
 ) -> list[Job]:
-    """构造采集任务。full=True 时补齐股债利差所需的长历史。"""
+    """构造采集任务。
+
+    - 默认：`full=True` 补齐 5~6 年历史，否则只取最近 400 天（增量）；
+    - `years=N`：覆盖上面的年限，回补最近 N 年（用于只补部分指标，例如情绪字段补 2 年）。
+    """
     end = today
 
+    def start_for(default_years: int, default_days: int) -> date:
+        if years is not None:
+            return _backfill_start(end, years)
+        return _backfill_start(end, default_years) if full else _window(end, default_days)
+
     def us10y() -> JobOutcome:
-        start = _backfill_start(end, CHART_BACKFILL_YEARS) if full else _window(end, 400)
+        start = start_for(CHART_BACKFILL_YEARS, 400)
         return JobOutcome({'us10y': us_treasury.fetch(session, start, end)})
 
     def cn10y() -> JobOutcome:
-        start = _backfill_start(end, SPREAD_BACKFILL_YEARS) if full else _window(end, 400)
+        start = start_for(SPREAD_BACKFILL_YEARS, 400)
         return JobOutcome({'cn10y': cn_bond.fetch(session, start, end)})
 
     def usdcny() -> JobOutcome:
-        start = _backfill_start(end, CHART_BACKFILL_YEARS) if full else _window(end, 400)
+        start = start_for(CHART_BACKFILL_YEARS, 400)
         return JobOutcome({'usdcny': fx_usdcny.fetch(session, start, end)})
 
     def xauusd() -> JobOutcome:
-        start = _backfill_start(end, CHART_BACKFILL_YEARS) if full else _window(end, 400)
+        start = start_for(CHART_BACKFILL_YEARS, 400)
         return JobOutcome({'xauusd': gold_lbma.fetch(session, start, end)})
 
     def breadth() -> JobOutcome:
-        start = _backfill_start(end, CHART_BACKFILL_YEARS) if full else _window(end, 400)
+        start = start_for(CHART_BACKFILL_YEARS, 400)
         fetched = mx.fetch_a_share_breadth(session, api_key or '', start, end)
         return JobOutcome(
             {metric: item.rows for metric, item in fetched.items()},
@@ -103,16 +113,25 @@ def build_jobs(
         )
 
     def hs300_close() -> JobOutcome:
-        start = _backfill_start(end, CHART_BACKFILL_YEARS) if full else _window(end, 400)
+        start = start_for(CHART_BACKFILL_YEARS, 400)
         fetched = mx.fetch_hs300_close(session, api_key or '', start, end)
         warnings = {'hs300_close': '; '.join(fetched.warnings)} if fetched.warnings else {}
         return JobOutcome({'hs300_close': fetched.rows}, warnings)
 
     def hs300_pe() -> JobOutcome:
-        start = _backfill_start(end, SPREAD_BACKFILL_YEARS) if full else _window(end, 400)
+        start = start_for(SPREAD_BACKFILL_YEARS, 400)
         fetched = mx.fetch_hs300_pe(session, api_key or '', start, end)
         warnings = {'hs300_pe_ttm': '; '.join(fetched.warnings)} if fetched.warnings else {}
         return JobOutcome({'hs300_pe_ttm': fetched.rows}, warnings)
+
+    def a_share_activity() -> JobOutcome:
+        """A股情绪算法的原始输入（成交额/成交量/换手率/涨跌停家数/融资净买入）。"""
+        start = start_for(CHART_BACKFILL_YEARS, 400)
+        fetched = mx.fetch_a_share_activity(session, api_key or '', start, end)
+        return JobOutcome(
+            {metric: item.rows for metric, item in fetched.items()},
+            {metric: '; '.join(item.warnings) for metric, item in fetched.items() if item.warnings},
+        )
 
     return [
         Job('美国国债', ('us10y',), us10y),
@@ -122,6 +141,12 @@ def build_jobs(
         Job('A股涨跌家数', ('adv_count', 'dec_count', 'flat_count'), breadth, requires_mx=True),
         Job('沪深300指数', ('hs300_close',), hs300_close, requires_mx=True),
         Job('沪深300估值', ('hs300_pe_ttm',), hs300_pe, requires_mx=True),
+        Job(
+            'A股情绪输入',
+            ('amount', 'volume', 'turnover_rate', 'margin_net_buy', 'limit_up_count', 'limit_down_count'),
+            a_share_activity,
+            requires_mx=True,
+        ),
     ]
 
 
@@ -194,8 +219,11 @@ def collect(
     today: date | None = None,
     session: requests.Session | None = None,
     api_key: str | None = None,
+    years: int | None = None,
 ) -> list[MetricResult]:
     """执行一次采集。返回每个指标的结果，失败不抛出。"""
+    if years is not None and years < 1:
+        raise ValueError(f'years 必须 >= 1，收到 {years}')
     conn = db.connect(db_path)
     db.init_db(conn)
     session = session or new_session()
@@ -206,7 +234,7 @@ def collect(
     only_set = set(only) if only else None
     results: list[MetricResult] = []
 
-    for job in build_jobs(session, today=today, full=full, api_key=api_key):
+    for job in build_jobs(session, today=today, full=full, api_key=api_key, years=years):
         metrics = tuple(m for m in job.metrics if only_set is None or m in only_set)
         if not metrics:
             continue
@@ -264,7 +292,7 @@ def collect(
                         conn,
                         metric,
                         status='missing',
-                        message='数据源未返回该指标数据',
+                        message=outcome.warnings.get(metric) or '数据源未返回该指标数据',
                         fetched_at=fetched_at,
                     )
                 )

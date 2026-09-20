@@ -303,8 +303,12 @@ _STATUS_SEVERITY = {
 }
 
 
-def _worse_status(*statuses: str) -> str:
+def worse_status(*statuses: str) -> str:
+    """取最严重的一个状态（页面聚合多个来源时用）。"""
     return max(statuses, key=lambda item: _STATUS_SEVERITY.get(item, 0))
+
+
+_worse_status = worse_status  # 兼容既有调用与测试
 
 
 def _build_spread(

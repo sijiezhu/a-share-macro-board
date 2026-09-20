@@ -4,6 +4,7 @@
 用法：
     python update_data.py                # 增量更新
     python update_data.py --full         # 首次运行，补齐股债利差所需历史
+    python update_data.py --years 2 --only amount --only volume   # 只补最近 2 年
     python update_data.py --only cn10y --only hs300_pe_ttm
     python update_data.py --db data/macroboard.sqlite3
 
@@ -26,9 +27,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--db', type=Path, default=DEFAULT_DB_PATH, help='SQLite 数据库路径')
     parser.add_argument('--env-file', type=Path, default=DEFAULT_ENV_FILE, help='可选的环境变量文件')
     parser.add_argument('--full', action='store_true', help='补齐股债利差所需的历史数据')
+    parser.add_argument(
+        '--years',
+        type=int,
+        default=None,
+        metavar='N',
+        help='覆盖回补年限：取最近 N 年（用于只给部分指标补历史，例如情绪字段补 2 年）',
+    )
     parser.add_argument('--only', action='append', choices=sorted(SERIES), help='只采集指定指标')
     parser.add_argument('--quiet', action='store_true', help='只输出一行总结')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.years is not None and args.years < 1:
+        parser.error('--years 必须 >= 1')
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     except PermissionError as exc:
         print(f'[警告] {exc}', file=sys.stderr)
 
-    results = collect(args.db, full=args.full, only=args.only)
+    results = collect(args.db, full=args.full, only=args.only, years=args.years)
 
     if not args.quiet:
         print(f'数据文件：{args.db}')

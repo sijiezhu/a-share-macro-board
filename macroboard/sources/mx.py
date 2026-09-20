@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -24,6 +25,15 @@ QUERY_HS300_CLOSE_YEAR = '沪深300指数收盘价 {year}年1月1日至{year}年
 QUERY_ADV_YEAR = '沪深A股上涨家数 {year}年1月1日至{year}年12月31日每个交易日'
 QUERY_DEC_YEAR = '沪深A股下跌家数 {year}年1月1日至{year}年12月31日每个交易日'
 QUERY_FLAT_YEAR = '沪深A股平盘家数 {year}年1月1日至{year}年12月31日每个交易日'
+
+# A股情绪算法的输入字段（macroboard.sentiment）；查询语句变更必须同步 docs/DATA_SOURCES.md。
+QUERY_AMOUNT_YEAR = '沪深两市A股成交额 {year}年1月1日至{year}年12月31日每个交易日'
+QUERY_VOLUME_YEAR = '沪深两市A股成交量 {year}年1月1日至{year}年12月31日每个交易日'
+QUERY_TURNOVER_YEAR = '沪深两市A股换手率 {year}年1月1日至{year}年12月31日每个交易日'
+QUERY_LIMIT_UP_YEAR = '沪深A股涨停家数 {year}年1月1日至{year}年12月31日每个交易日'
+QUERY_LIMIT_DOWN_YEAR = '沪深A股跌停家数 {year}年1月1日至{year}年12月31日每个交易日'
+QUERY_MARGIN_BUY_YEAR = '沪深两市融资买入额 {year}年1月1日至{year}年12月31日每个交易日'
+QUERY_MARGIN_REPAY_YEAR = '沪深两市融资偿还额 {year}年1月1日至{year}年12月31日每个交易日'
 
 _NUMBER_RE = re.compile(r'-?\d+(?:\.\d+)?')
 _DATE_RE = re.compile(r'(\d{4})-(\d{2})-(\d{2})')
@@ -219,3 +229,76 @@ def parse_pe_value(raw: object) -> float | None:
     if value is None or value <= 0:
         return None
     return value
+
+
+def build_margin_net_buy(
+    buy_rows: Sequence[tuple[date, float]],
+    repay_rows: Sequence[tuple[date, float]],
+) -> list[tuple[date, float]]:
+    """融资净买入 = 同日融资买入额 − 同日融资偿还额。
+
+    只保留两侧都有观测的日期：不做前向填充、不做插值（与股债利差同口径），
+    因此缺单侧的交易日会被整条丢弃，而不是用另一侧顶替。
+    """
+    repay = {day: float(value) for day, value in repay_rows}
+    out: list[tuple[date, float]] = []
+    for day, buy in buy_rows:
+        other = repay.get(day)
+        if other is None:
+            continue
+        out.append((day, float(buy) - other))
+    out.sort(key=lambda item: item[0])
+    return out
+
+
+def fetch_margin_net_buy(
+    session: requests.Session,
+    api_key: str,
+    start: date,
+    end: date,
+) -> FetchedSeries:
+    """两融净买入：分别抓融资买入额与融资偿还额后按同日相减。"""
+    buy = fetch_year_series(session, api_key, QUERY_MARGIN_BUY_YEAR, start, end)
+    repay = fetch_year_series(session, api_key, QUERY_MARGIN_REPAY_YEAR, start, end)
+    rows = build_margin_net_buy(buy.rows, repay.rows)
+    warnings = [*buy.warnings, *repay.warnings]
+    if not rows:
+        raise SourceError('融资买入额与融资偿还额没有共同数据日期')
+    dropped = len(buy.rows) - len(rows)
+    if dropped > 0:
+        warnings.append(f'{dropped} 个交易日只有单侧两融数据，已整条跳过（不做前向填充）')
+    return FetchedSeries(rows=rows, warnings=warnings)
+
+
+def fetch_a_share_activity(
+    session: requests.Session,
+    api_key: str,
+    start: date,
+    end: date,
+) -> dict[str, FetchedSeries]:
+    """A股情绪算法的原始输入：成交额/成交量/换手率/涨跌停家数/融资净买入。
+
+    单个指标失败只影响它自己（返回空序列并带告警，编排层据此标为 missing），
+    全部指标都失败才抛 SourceError。
+    """
+    plan = (
+        ('amount', QUERY_AMOUNT_YEAR),
+        ('volume', QUERY_VOLUME_YEAR),
+        ('turnover_rate', QUERY_TURNOVER_YEAR),
+        ('limit_up_count', QUERY_LIMIT_UP_YEAR),
+        ('limit_down_count', QUERY_LIMIT_DOWN_YEAR),
+    )
+    out: dict[str, FetchedSeries] = {}
+    for metric, template in plan:
+        try:
+            out[metric] = fetch_year_series(session, api_key, template, start, end)
+        except SourceError as exc:
+            out[metric] = FetchedSeries(rows=[], warnings=[f'{metric} 抓取失败：{exc}'])
+    try:
+        out['margin_net_buy'] = fetch_margin_net_buy(session, api_key, start, end)
+    except SourceError as exc:
+        out['margin_net_buy'] = FetchedSeries(rows=[], warnings=[f'margin_net_buy 抓取失败：{exc}'])
+    if not any(item.rows for item in out.values()):
+        details = '; '.join(warning for item in out.values() for warning in item.warnings)
+        raise SourceError(f'A股情绪输入全部失败：{details}')
+    return out

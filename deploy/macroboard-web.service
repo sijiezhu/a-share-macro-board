@@ -1,0 +1,31 @@
+[Unit]
+Description=A股投资信息看板 页面（Streamlit，行情库只读，访问计数写本机 visits.sqlite3）
+Documentation=file:%h/Documents/macro_dashboard/docs/SCHEDULING.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/macro_dashboard
+# 只读 .env 里的凭证（MX_APIKEY）；页面本身不发网络请求
+# 页面唯一写入：data/visits.sqlite3（访问统计，含客户端 IP；需要完全不写入时加
+# Environment=MACROBOARD_VISIT_LOG=0）
+EnvironmentFile=%h/Documents/macro_dashboard/.env
+# 监听地址（三种取值的差别，详见 deploy/README.md「局域网访问」）：
+#   127.0.0.1       仅本机（最安全，局域网访问会 connection refused）
+#   192.168.1.199  只在本机网卡上监听（比 0.0.0.0 窄，但 DHCP 换 IP 后服务会起不来）
+#   0.0.0.0         所有接口（当前取值：对 IP 变化免疫，含未来新增的 VPN/虚拟网卡）
+# 页面没有登录鉴权：同网段任何设备都能查看库里全部数据。手动「立即采集一次」按钮
+# 已默认关闭（见 app.py 的 MANUAL_REFRESH_ENABLED），因此局域网侧不会触发采集；
+# 需要临时开启按钮时给本单元加 Environment=MACROBOARD_ENABLE_MANUAL_REFRESH=1。
+ExecStart=%h/Documents/macro_dashboard/.venv/bin/streamlit run app.py \
+    --server.headless true \
+    --server.address 0.0.0.0 \
+    --server.port 8501 \
+    --server.fileWatcherType none \
+    --browser.gatherUsageStats false
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

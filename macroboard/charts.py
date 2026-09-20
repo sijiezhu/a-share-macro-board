@@ -42,6 +42,10 @@ RESOLUTION_OPTIONS = (
     RESOLUTION_RAW,
 )
 
+# 四象限阈值（与 macroboard/sentiment 的默认阈值一致，仅用于绘图参考线）
+QUADRANT_LOW = 40.0
+QUADRANT_HIGH = 60.0
+
 # 自动模式的分辨率阈值（自然日）
 DAILY_MAX_DAYS = 400
 WEEKLY_MAX_DAYS = 3 * 365
@@ -55,18 +59,34 @@ class ChartSpec:
     color: str
     decimals: int = 2
     zero_line: bool = False
+    hline_values: tuple[float, ...] = ()
 
 
-CHART_SPECS: tuple[ChartSpec, ...] = (
+# 长线指标：宏观利率/汇率/金价，用于观察大周期环境。
+LONG_TERM_CHART_SPECS: tuple[ChartSpec, ...] = (
     ChartSpec('us10y', '美国10年期国债收益率', '%', '#6ba8ff', 2),
     ChartSpec('cn10y', '中债10年期国债收益率', '%', '#5eead4', 2),
     ChartSpec('usdcny', '美元兑人民币（在岸即期）', 'CNY/USD', '#f5b13d', 4),
     ChartSpec('xauusd', '现货黄金参考价 (LBMA)', 'USD/金衡盎司', '#ffc857', 2),
+)
+
+# 短线指标：A股市场宽度与近期动量。
+SHORT_TERM_CHART_SPECS: tuple[ChartSpec, ...] = (
     ChartSpec('adv_ratio', '沪深A股上涨家数占比', '%', '#ff4d87', 2),
     ChartSpec('hs300_20d', '沪深300近20个交易日涨跌幅', '%', '#b28dff', 2, zero_line=True),
 )
 
+# 全部曲线规格（长线在前、短线在后），供不区分分组时按原顺序遍历使用。
+CHART_SPECS: tuple[ChartSpec, ...] = LONG_TERM_CHART_SPECS + SHORT_TERM_CHART_SPECS
+
 SPREAD_SPEC = ChartSpec('spread', '沪深300股债利差', '个百分点', '#5eead4', 2)
+
+# 情绪指数的三条曲线（0—100，用 40/60 阈值线标出四象限边界）
+SENTIMENT_SPECS: tuple[ChartSpec, ...] = (
+    ChartSpec('sentiment_index', '综合情绪指数', '分', '#b28dff', 1, hline_values=(40.0, 60.0)),
+    ChartSpec('participation_index', '参与度指数', '分', '#5eead4', 1, hline_values=(40.0, 60.0)),
+    ChartSpec('direction_index', '方向指数', '分', '#ffc857', 1, hline_values=(40.0, 60.0)),
+)
 
 
 def auto_resolution(span_in_days: int) -> str:
@@ -189,6 +209,7 @@ def build_figure(
     height: int = 240,
     boundaries: list[tuple[date, str]] | None = None,
     show_hover: bool = True,
+    y_range: tuple[float, float] | None = None,
 ) -> go.Figure:
     figure = go.Figure()
     figure.add_trace(
@@ -208,6 +229,12 @@ def build_figure(
     )
     if spec.zero_line:
         figure.add_hline(y=0, line={'color': 'rgba(255,255,255,.25)', 'width': 1})
+    for value in spec.hline_values:
+        figure.add_hline(
+            y=value,
+            line={'color': 'rgba(255,255,255,.18)', 'width': 1, 'dash': 'dot'},
+            layer='below',
+        )
     if boundaries and sampled:
         first, last = sampled[0][0], sampled[-1][0]
         for position, label in boundaries:
@@ -249,6 +276,7 @@ def build_figure(
             'zeroline': False,
             'ticksuffix': '' if spec.unit != '%' else '%',
             'nticks': 4,
+            'range': list(y_range) if y_range else None,
         },
         plot_bgcolor='rgba(0,0,0,0)',
         paper_bgcolor='rgba(0,0,0,0)',
@@ -270,3 +298,162 @@ def latest_text(sampled: list[tuple[date, float]], spec: ChartSpec) -> str:
     else:
         body = f'{value:,.{spec.decimals}f}'
     return f'{body} · {day.isoformat()}'
+
+
+QUADRANT_LABELS: tuple[tuple[float, float, str], ...] = (
+    # (参与度下界, 方向下界, 文案) —— 与算法层的四象限命名一致，仅作图上标注
+    (QUADRANT_HIGH, QUADRANT_HIGH, '贪婪/主升'),
+    (QUADRANT_HIGH, 0.0, '恐慌抛售（放量急跌型冰点）'),
+    (0.0, 0.0, '缩量阴跌（清淡型冰点）'),
+    (0.0, QUADRANT_HIGH, '温和回暖'),
+)
+
+
+def build_quadrant_figure(
+    points: list[tuple[date, float, float]],
+    *,
+    low: float = QUADRANT_LOW,
+    high: float = QUADRANT_HIGH,
+    height: int = 380,
+    max_points: int = 10,
+) -> go.Figure:
+    """四象限走势图：x = 参与度指数，y = 方向指数。
+
+    只画最近 `max_points`（默认 10）个交易日的点，相邻点用箭头连接，
+    **箭头由过去指向未来**，颜色随之由浅到深；只画真实观测，不做任何插值。
+    `points` 为 (日期, 参与度, 方向) 升序序列。
+    """
+    recent = points[-max_points:] if max_points and max_points > 0 else list(points)
+    figure = go.Figure()
+    # 象限底色（先画背景，再叠数据）
+    figure.add_shape(type='rect', x0=0, x1=low, y0=0, y1=low, fillcolor='rgba(120,140,180,.10)', line={'width': 0}, layer='below')
+    figure.add_shape(type='rect', x0=high, x1=100, y0=0, y1=low, fillcolor='rgba(255,107,139,.12)', line={'width': 0}, layer='below')
+    figure.add_shape(type='rect', x0=0, x1=low, y0=high, y1=100, fillcolor='rgba(94,234,212,.12)', line={'width': 0}, layer='below')
+    figure.add_shape(type='rect', x0=high, x1=100, y0=high, y1=100, fillcolor='rgba(178,141,255,.12)', line={'width': 0}, layer='below')
+    for value in (low, high):
+        figure.add_hline(y=value, line={'color': 'rgba(255,255,255,.18)', 'width': 1, 'dash': 'dot'})
+        # 用 add_shape 而不是 add_vline：后者在部分 plotly 版本会对坐标轴做日期推算而报错
+        figure.add_shape(
+            type='line',
+            x0=value,
+            x1=value,
+            y0=0,
+            y1=1,
+            yref='paper',
+            line={'color': 'rgba(255,255,255,.18)', 'width': 1, 'dash': 'dot'},
+            layer='below',
+        )
+
+    if recent:
+        order = list(range(len(recent)))
+        figure.add_trace(
+            go.Scatter(
+                x=[item[1] for item in recent],
+                y=[item[2] for item in recent],
+                mode='markers',
+                marker={
+                    'size': [6.0 + 0.5 * index for index in order],
+                    'color': order,
+                    'colorscale': [[0, 'rgba(178,141,255,.35)'], [1, 'rgba(255,200,87,.95)']],
+                    'showscale': False,
+                    'line': {'color': 'rgba(27,29,35,.85)', 'width': 1},
+                },
+                customdata=[[item[0].isoformat()] for item in recent],
+                hovertemplate='%{customdata[0]}<br>参与度 %{x:.1f} · 方向 %{y:.1f}<extra></extra>',
+                name='交易日',
+            )
+        )
+        # 相邻交易日之间用箭头连接：从旧点指向新点（x/ax 为数据坐标）
+        for index in range(len(recent) - 1):
+            older = recent[index]
+            newer = recent[index + 1]
+            alpha = 0.35 + 0.6 * (index + 1) / max(len(recent) - 1, 1)
+            figure.add_annotation(
+                x=newer[1],
+                y=newer[2],
+                ax=older[1],
+                ay=older[2],
+                xref='x',
+                yref='y',
+                axref='x',
+                ayref='y',
+                text='',
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.0,
+                arrowwidth=1.4,
+                arrowcolor=f'rgba(178,141,255,{alpha:.2f})',
+                standoff=7,
+                startstandoff=2,
+            )
+        latest = recent[-1]
+        figure.add_trace(
+            go.Scatter(
+                x=[latest[1]],
+                y=[latest[2]],
+                mode='markers',
+                marker={'size': 14, 'color': 'rgba(255,200,87,0)', 'line': {'color': '#ffc857', 'width': 2}},
+                hoverinfo='skip',
+                name='最新',
+            )
+        )
+        figure.add_annotation(
+            x=latest[1],
+            y=latest[2],
+            text=f'最新 {latest[0].strftime("%m-%d")}',
+            showarrow=False,
+            font={'size': 10, 'color': '#ffc857'},
+            xanchor='left' if latest[1] < 80 else 'right',
+            yanchor='bottom',
+            xshift=8,
+            yshift=6,
+        )
+        oldest = recent[0]
+        if len(recent) > 1:
+            figure.add_annotation(
+                x=oldest[1],
+                y=oldest[2],
+                text=f'{len(recent) - 1} 个交易日前 {oldest[0].strftime("%m-%d")}',
+                showarrow=False,
+                font={'size': 9, 'color': '#8b909b'},
+                xanchor='right' if oldest[1] > 20 else 'left',
+                yanchor='top',
+                xshift=-8 if oldest[1] > 20 else 8,
+                yshift=-6,
+            )
+
+    for x0, y0, label in QUADRANT_LABELS:
+        figure.add_annotation(
+            x=x0 + (6 if x0 < 50 else 94),
+            y=y0 + (6 if y0 < 50 else 94),
+            text=label,
+            showarrow=False,
+            font={'size': 10, 'color': '#8b909b'},
+            xanchor='left' if x0 < 50 else 'right',
+            yanchor='bottom' if y0 < 50 else 'top',
+        )
+
+    figure.update_layout(
+        height=height,
+        margin={'l': 4, 'r': 4, 't': 18, 'b': 4},
+        xaxis={
+            'title': {'text': '参与度指数', 'font': {'size': 11}},
+            'range': [0, 100],
+            'gridcolor': 'rgba(255,255,255,.06)',
+            'showline': False,
+            'nticks': 5,
+        },
+        yaxis={
+            'title': {'text': '方向指数', 'font': {'size': 11}},
+            'range': [0, 100],
+            'gridcolor': 'rgba(255,255,255,.06)',
+            'showline': False,
+            'nticks': 5,
+        },
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font={'color': '#c9cdd6', 'size': 11},
+        showlegend=False,
+        hovermode='closest',
+    )
+    return figure

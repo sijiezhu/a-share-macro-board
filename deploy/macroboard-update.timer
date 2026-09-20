@@ -1,0 +1,13 @@
+[Unit]
+Description=每天 08:30（Asia/Shanghai）采集 A股投资信息看板 数据
+Documentation=file:%h/Documents/macro_dashboard/docs/SCHEDULING.md
+
+[Timer]
+# 显式指定时区，避免宿主机时区不是北京时间时算错
+OnCalendar=*-*-* 08:30:00 Asia/Shanghai
+# 关机/休眠错过的当日采集在开机后补跑一次
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

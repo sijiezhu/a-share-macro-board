@@ -1,0 +1,16 @@
+[Unit]
+Description=A股投资信息看板 数据采集（单次）
+Documentation=file:%h/Documents/macro_dashboard/docs/SCHEDULING.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/macro_dashboard
+EnvironmentFile=%h/Documents/macro_dashboard/.env
+# --quiet：journal 里只留一行总结；失败时退出码 1，可用 systemctl --user status 查看
+ExecStart=%h/Documents/macro_dashboard/.venv/bin/python update_data.py --quiet
+# 实测一次增量采集约 2.5 分钟（妙想最小间隔 1.5 秒 + 退避重试）；
+# 显式放宽，避免某些发行版默认 90 秒把采集打断在半途
+TimeoutStartSec=30min
+Nice=5

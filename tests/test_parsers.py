@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import date
+from unittest import mock
 
 from macroboard.sources import cn_bond, fx_usdcny, gold_lbma, mx, us_treasury
 
@@ -118,6 +119,78 @@ class MXTests(unittest.TestCase):
     def test_extract_series_raises_without_tables(self):
         with self.assertRaises(mx.SourceError):
             mx.extract_series({'code': 0, 'data': {'data': {'searchDataResultDTO': {}}}})
+
+    def test_query_templates_use_natural_year(self):
+        for template in (
+            mx.QUERY_AMOUNT_YEAR,
+            mx.QUERY_VOLUME_YEAR,
+            mx.QUERY_TURNOVER_YEAR,
+            mx.QUERY_LIMIT_UP_YEAR,
+            mx.QUERY_LIMIT_DOWN_YEAR,
+            mx.QUERY_MARGIN_BUY_YEAR,
+            mx.QUERY_MARGIN_REPAY_YEAR,
+        ):
+            with self.subTest(template=template):
+                text = template.format(year=2026)
+                self.assertIn('2026年1月1日至2026年12月31日', text)
+                self.assertIn('每个交易日', text)
+
+    def test_margin_net_buy_requires_same_date(self):
+        buy = [(date(2026, 9, 15), 300.0), (date(2026, 9, 16), 500.0), (date(2026, 9, 18), 900.0)]
+        repay = [(date(2026, 9, 15), 100.0), (date(2026, 9, 17), 400.0), (date(2026, 9, 18), 950.0)]
+        rows = mx.build_margin_net_buy(buy, repay)
+        self.assertEqual(
+            rows,
+            [(date(2026, 9, 15), 200.0), (date(2026, 9, 18), -50.0)],
+        )
+
+    def test_margin_net_buy_sorts_and_allows_negative(self):
+        buy = [(date(2026, 9, 17), 100.0), (date(2026, 9, 16), 100.0)]
+        repay = [(date(2026, 9, 17), 250.0), (date(2026, 9, 16), 50.0)]
+        rows = mx.build_margin_net_buy(buy, repay)
+        self.assertEqual([day for day, _ in rows], [date(2026, 9, 16), date(2026, 9, 17)])
+        self.assertAlmostEqual(rows[1][1], -150.0, places=9)
+
+    def test_margin_net_buy_with_no_common_date_is_empty(self):
+        rows = mx.build_margin_net_buy(
+            [(date(2026, 9, 17), 100.0)], [(date(2026, 9, 16), 100.0)]
+        )
+        self.assertEqual(rows, [])
+
+    def test_activity_fetch_marks_single_failure_without_killing_others(self):
+        def fake_year_series(session, api_key, template, start, end):
+            if template == mx.QUERY_VOLUME_YEAR:
+                raise mx.SourceError('妙想未返回数据')
+            return mx.FetchedSeries(rows=[(date(2026, 9, 18), 1.0)])
+
+        with mock.patch.object(mx, 'fetch_year_series', side_effect=fake_year_series), mock.patch.object(
+            mx, 'fetch_margin_net_buy', return_value=mx.FetchedSeries(rows=[(date(2026, 9, 18), -5.0)])
+        ):
+            out = mx.fetch_a_share_activity(
+                session=object(),  # type: ignore[arg-type]
+                api_key='test',
+                start=date(2026, 1, 1),
+                end=date(2026, 9, 18),
+            )
+        self.assertEqual(out['volume'].rows, [])
+        self.assertTrue(out['volume'].warnings)
+        self.assertEqual(out['amount'].rows, [(date(2026, 9, 18), 1.0)])
+        self.assertEqual(out['margin_net_buy'].rows, [(date(2026, 9, 18), -5.0)])
+
+    def test_activity_fetch_raises_when_everything_fails(self):
+        def always_fail(*args, **kwargs):
+            raise mx.SourceError('妙想未返回数据')
+
+        with mock.patch.object(mx, 'fetch_year_series', side_effect=always_fail), mock.patch.object(
+            mx, 'fetch_margin_net_buy', side_effect=always_fail
+        ):
+            with self.assertRaises(mx.SourceError):
+                mx.fetch_a_share_activity(
+                    session=object(),  # type: ignore[arg-type]
+                    api_key='test',
+                    start=date(2026, 1, 1),
+                    end=date(2026, 9, 18),
+                )
 
 
 if __name__ == '__main__':

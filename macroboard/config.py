@@ -132,6 +132,67 @@ SERIES: dict[str, SeriesSpec] = {
         max_lag_days=12,
         note='用于股债利差，必须与国债收益率取同一数据日期。',
     ),
+    # --- A股情绪算法的输入（见 docs/SENTIMENT_ALGORITHM.md §3.2） ---
+    'amount': SeriesSpec(
+        key='amount',
+        label='沪深两市A股成交额',
+        unit='元',
+        source='东方财富妙想数据',
+        source_detail='沪深A股(板块) 成交额(合计)，sourceCode TVAL，日频',
+        change_kind='pct',
+        max_lag_days=10,
+        note='参与度分量；单位元，不做单位换算。',
+    ),
+    'volume': SeriesSpec(
+        key='volume',
+        label='沪深两市A股成交量',
+        unit='股',
+        source='东方财富妙想数据',
+        source_detail='沪深A股(板块) 成交量(合计)，日频',
+        change_kind='pct',
+        max_lag_days=10,
+        note='参与度分量（量比）；停牌日按缺失处理，不参与量比与 20 日峰值。',
+    ),
+    'turnover_rate': SeriesSpec(
+        key='turnover_rate',
+        label='沪深两市A股换手率',
+        unit='%',
+        source='东方财富妙想数据',
+        source_detail='沪深两市A股换手率，日频；口径按**总股本**（2026-09-19 口径确认）',
+        change_kind='pp',
+        max_lag_days=10,
+        note='参与度分量；换手率按总股本口径（分母为总股本，非自由流通市值），页面需标注。',
+    ),
+    'margin_net_buy': SeriesSpec(
+        key='margin_net_buy',
+        label='融资净买入额（两市合计）',
+        unit='元',
+        source='东方财富妙想数据',
+        source_detail='融资买入额 − 融资偿还额，两者按同一数据日期相减（不做前向填充）',
+        change_kind='abs',
+        max_lag_days=12,
+        note='两融数据 T+1 公布，情绪算法默认按 availability_lag=1 使用；可为负值。',
+    ),
+    'limit_up_count': SeriesSpec(
+        key='limit_up_count',
+        label='沪深A股涨停家数',
+        unit='家',
+        source='东方财富妙想数据',
+        source_detail='沪深A股(板块) 涨停家数，日频',
+        change_kind='abs',
+        max_lag_days=10,
+        note='方向分量（涨跌停比）；家数口径由供应商给定。',
+    ),
+    'limit_down_count': SeriesSpec(
+        key='limit_down_count',
+        label='沪深A股跌停家数',
+        unit='家',
+        source='东方财富妙想数据',
+        source_detail='沪深A股(板块) 跌停家数，日频',
+        change_kind='abs',
+        max_lag_days=10,
+        note='方向分量（涨跌停比）。',
+    ),
 }
 
 # 采集参数
@@ -143,6 +204,12 @@ LOOKBACK_DAYS = {
     'a_share_sentiment': 30,
     'hs300_close': 120,
     'hs300_pe_ttm': 60,
+    'amount': 400,
+    'volume': 400,
+    'turnover_rate': 400,
+    'margin_net_buy': 400,
+    'limit_up_count': 400,
+    'limit_down_count': 400,
 }
 
 # 首次补齐历史所需年限
@@ -155,6 +222,26 @@ CHART_BACKFILL_YEARS = 5
 CHART_RECENT_FULL_DAYS = 90
 CHART_WEEKLY_UNTIL_DAYS = 365
 CHART_MONTHLY_UNTIL_DAYS = 3 * 365
-CHART_RANGE_OPTIONS = {'1年': 365, '3年': 3 * 365, '5年': 5 * 365, '全部': None}
+# 页面「时间范围」选项：键为标签，值为自然日天数（None = 全部历史）。
+# 短线读数（如 20 日动量）需要比「1年」更细的近端窗口，因此提供月级选项。
+CHART_RANGE_OPTIONS = {
+    '1个月': 30,
+    '3个月': 90,
+    '1年': 365,
+    '3年': 3 * 365,
+    '5年': 5 * 365,
+    '全部': None,
+}
 
 MX_ENV_VAR = 'MX_APIKEY'
+
+# 情绪指标窗口（改这里就能换参照系，不需要改算法代码）：
+#   SENTIMENT_PERCENTILE_WINDOW：分位窗口的交易日数，也可写预设名（只对 default_config 生效时用名字）
+#     21 = 1 个月（最灵敏、噪声最高、约 1 个月数据即可出数）
+#     63 = 1 个季度（噪声与灵敏度的折中）
+#     126 = 半年
+#     252 = 1 年（当前默认，与规格书一致）
+#   SENTIMENT_WINDOW_PROFILE：'spec'（全部同一窗口）/ 'mixed'（自带 20 日平滑的分量用更长窗口）
+#     另有 'fast'、'multiscale' 两个画像，详见 docs/SENTIMENT_ALGORITHM.md §3.5
+SENTIMENT_PERCENTILE_WINDOW: int | str = 252
+SENTIMENT_WINDOW_PROFILE: str = 'spec'

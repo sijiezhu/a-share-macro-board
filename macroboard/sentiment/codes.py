@@ -1,0 +1,116 @@
+"""Neutral state codes emitted by the sentiment algorithm layer.
+
+This module is part of the algorithm layer: it must stay free of display text
+(no CJK characters, enforced by tests). Human-readable copy lives only in
+``macroboard.sentiment.labels``.
+"""
+
+from __future__ import annotations
+
+# --- market state (four quadrants + unavailable) -------------------------------
+STATE_GREED = 'STATE_GREED'
+STATE_PANIC = 'STATE_PANIC'
+STATE_COLD = 'STATE_COLD'
+STATE_THAW = 'STATE_THAW'
+STATE_NEUTRAL = 'STATE_NEUTRAL'
+STATE_UNAVAILABLE = 'STATE_UNAVAILABLE'
+
+STATE_CODES: tuple[str, ...] = (
+    STATE_GREED,
+    STATE_PANIC,
+    STATE_COLD,
+    STATE_THAW,
+    STATE_NEUTRAL,
+    STATE_UNAVAILABLE,
+)
+
+# --- index bands (for a true 2x2 grid) ----------------------------------------
+BAND_HIGH = 'BAND_HIGH'
+BAND_MID = 'BAND_MID'
+BAND_LOW = 'BAND_LOW'
+BAND_UNAVAILABLE = 'BAND_UNAVAILABLE'
+
+BAND_CODES: tuple[str, ...] = (BAND_HIGH, BAND_MID, BAND_LOW, BAND_UNAVAILABLE)
+
+# --- panic score conditions ---------------------------------------------------
+PANIC_TURNOVER_PCT_HIGH = 'PANIC_TURNOVER_PCT_HIGH'
+PANIC_RETURN_20D_LOW = 'PANIC_RETURN_20D_LOW'
+PANIC_VOLUME_RATIO_HIGH = 'PANIC_VOLUME_RATIO_HIGH'
+PANIC_HIST_NEGATIVE_FALLING = 'PANIC_HIST_NEGATIVE_FALLING'
+PANIC_DOWN_RATIO_HIGH = 'PANIC_DOWN_RATIO_HIGH'
+
+PANIC_CONDITION_CODES: tuple[str, ...] = (
+    PANIC_TURNOVER_PCT_HIGH,
+    PANIC_RETURN_20D_LOW,
+    PANIC_VOLUME_RATIO_HIGH,
+    PANIC_HIST_NEGATIVE_FALLING,
+    PANIC_DOWN_RATIO_HIGH,
+)
+
+# --- reversal watch conditions and gates --------------------------------------
+REV_PANIC_SCORE = 'REV_PANIC_SCORE'
+REV_HIST_SHRINKING = 'REV_HIST_SHRINKING'
+REV_VOLUME_SHRUNK = 'REV_VOLUME_SHRUNK'
+REV_DIRECTION_REBOUND = 'REV_DIRECTION_REBOUND'
+
+REV_CONDITION_CODES: tuple[str, ...] = (
+    REV_PANIC_SCORE,
+    REV_HIST_SHRINKING,
+    REV_VOLUME_SHRUNK,
+    REV_DIRECTION_REBOUND,
+)
+
+REV_BLOCK_PANIC_COVERAGE_LOW = 'REV_BLOCK_PANIC_COVERAGE_LOW'
+REV_BLOCK_PANIC_SCORE_MISSING = 'REV_BLOCK_PANIC_SCORE_MISSING'
+REV_BLOCK_CONDITION_DATA_MISSING = 'REV_BLOCK_CONDITION_DATA_MISSING'
+
+REV_BLOCK_CODES: tuple[str, ...] = (
+    REV_BLOCK_PANIC_COVERAGE_LOW,
+    REV_BLOCK_PANIC_SCORE_MISSING,
+    REV_BLOCK_CONDITION_DATA_MISSING,
+)
+
+# --- MACD + volume states -----------------------------------------------------
+MACD_VOL_GOLDEN_SURGE = 'MACD_VOL_GOLDEN_SURGE'
+MACD_VOL_GOLDEN_SHRINK = 'MACD_VOL_GOLDEN_SHRINK'
+MACD_VOL_DEAD_SURGE = 'MACD_VOL_DEAD_SURGE'
+MACD_VOL_DEAD_SHRINK = 'MACD_VOL_DEAD_SHRINK'
+MACD_VOL_GOLDEN_UNKNOWN = 'MACD_VOL_GOLDEN_UNKNOWN'
+MACD_VOL_DEAD_UNKNOWN = 'MACD_VOL_DEAD_UNKNOWN'
+MACD_VOL_DIVERGENCE = 'MACD_VOL_DIVERGENCE'
+MACD_VOL_NEUTRAL = 'MACD_VOL_NEUTRAL'
+MACD_VOL_UNAVAILABLE = 'MACD_VOL_UNAVAILABLE'
+
+MACD_VOL_STATES: tuple[str, ...] = (
+    MACD_VOL_GOLDEN_SURGE,
+    MACD_VOL_GOLDEN_SHRINK,
+    MACD_VOL_DEAD_SURGE,
+    MACD_VOL_DEAD_SHRINK,
+    MACD_VOL_GOLDEN_UNKNOWN,
+    MACD_VOL_DEAD_UNKNOWN,
+    MACD_VOL_DIVERGENCE,
+    MACD_VOL_NEUTRAL,
+    MACD_VOL_UNAVAILABLE,
+)
+
+# --- data quality -------------------------------------------------------------
+DQ_OK = 'DQ_OK'
+DQ_PARTIAL = 'DQ_PARTIAL'
+DQ_INSUFFICIENT = 'DQ_INSUFFICIENT'
+
+DATA_QUALITY_CODES: tuple[str, ...] = (DQ_OK, DQ_PARTIAL, DQ_INSUFFICIENT)
+
+# --- input column availability status ----------------------------------------
+STATUS_OK = 'ok'
+STATUS_MISSING = 'missing'
+STATUS_ALL_NAN = 'all_nan'
+STATUS_INSUFFICIENT_HISTORY = 'insufficient_history'
+STATUS_INVALID_VALUES = 'invalid_values'
+
+COLUMN_STATUSES: tuple[str, ...] = (
+    STATUS_OK,
+    STATUS_MISSING,
+    STATUS_ALL_NAN,
+    STATUS_INSUFFICIENT_HISTORY,
+    STATUS_INVALID_VALUES,
+)
