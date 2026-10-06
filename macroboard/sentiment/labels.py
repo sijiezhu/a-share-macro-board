@@ -14,12 +14,29 @@ import pandas as pd
 from . import codes
 
 STATE_LABELS: dict[str, str] = {
+    # 位置未知（缺少上证指数或 60 日均线样本不足）时的四象限基础文案
     codes.STATE_GREED: '贪婪/主升',
-    codes.STATE_PANIC: '恐慌抛售（放量急跌型冰点）',
-    codes.STATE_COLD: '缩量阴跌（清淡型冰点）',
+    codes.STATE_PANIC: '恐慌抛售',
+    codes.STATE_COLD: '缩量阴跌',
     codes.STATE_THAW: '温和回暖',
     codes.STATE_NEUTRAL: '中性震荡',
     codes.STATE_UNAVAILABLE: '不可用（数据不足）',
+    # 高位：上证指数收盘 > 60 日均线
+    codes.STATE_GREED_HIGH: '高位放量上涨（贪婪/高潮）',
+    codes.STATE_PANIC_HIGH: '高位放量急跌（上升趋势的终止预警）',
+    codes.STATE_COLD_HIGH: '高位缩量回落（滞涨转弱）',
+    codes.STATE_THAW_HIGH: '高位缩量上涨（量能未跟上）',
+    # 低位：上证指数收盘 <= 60 日均线
+    codes.STATE_GREED_LOW: '低位放量上涨（启动/修复）',
+    codes.STATE_PANIC_LOW: '低位放量急跌（恐慌抛售、冰点特征）',
+    codes.STATE_COLD_LOW: '低位缩量阴跌（清淡型冰点）',
+    codes.STATE_THAW_LOW: '低位缩量回暖（温和修复）',
+}
+
+POSITION_LABELS: dict[str, str] = {
+    codes.POS_HIGH: '高位',
+    codes.POS_LOW: '低位',
+    codes.POS_UNKNOWN: '位置未知',
 }
 
 BAND_LABELS: dict[str, str] = {
@@ -83,6 +100,11 @@ def describe_state(code: str) -> str:
         return STATE_LABELS[code]
     except KeyError as exc:
         raise ValueError(f'未知状态码：{code!r}') from exc
+
+
+def describe_position(code: str) -> str:
+    """价格位置码 -> 中文文案。未知码值直接报错，避免静默显示错口径。"""
+    return describe_code(POSITION_LABELS, code)
 
 
 def describe_code(mapping: Mapping[str, str], code: str) -> str:

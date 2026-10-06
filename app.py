@@ -16,7 +16,9 @@ from macroboard import charts, indicators, visits
 from macroboard.charts import (
     LONG_TERM_CHART_SPECS,
     RESOLUTION_OPTIONS,
+    SENTIMENT_CHART_SPECS,
     SENTIMENT_SPECS,
+    SH_INDEX_SPEC,
     SHORT_TERM_CHART_SPECS,
     SPREAD_SPEC,
 )
@@ -32,10 +34,16 @@ from macroboard.config import (
 )
 from macroboard.dashboard import Card, DashboardData, load_dashboard
 from macroboard.env import load_env_file
+from macroboard.sentiment import codes
 from macroboard.sentiment_view import (
+    ComponentValueInfo,
+    SentimentView,
     build_sentiment_view,
+    component_frame,
+    component_label,
     field_frame,
     render_context,
+    state_reference_frame,
 )
 
 MANUAL_REFRESH_COOLDOWN = timedelta(minutes=30)
@@ -366,6 +374,115 @@ def render_visit_stats(visit_db_path: Path) -> None:
         )
 
 
+def _composition_text(members: list[ComponentValueInfo], index_value: float | None) -> str:
+    """把「权重 × 分量最新值 = 指数」的算式写成一行（缺失分量显式写"不可用"）。"""
+    parts: list[str] = []
+    usable = 0
+    for info in members:
+        if info.weight_share is None or info.value is None:
+            parts.append(f'{info.label} 不可用')
+            continue
+        usable += 1
+        parts.append(f'{info.weight_share:.2f} × {info.label} {info.value:.1f}')
+    if usable == 0:
+        return '指数不可用：分量全部缺失'
+    total = '不可用' if index_value is None else f'{index_value:.1f}'
+    return ' + '.join(parts) + f' = {total}'
+
+
+def render_index_components(view: SentimentView, snapshot: dict) -> None:
+    """折叠显示参与度/方向指数用到的每个分量的最新取值、口径与权重。
+
+    分量的逐项明细只在需要核对时看，默认收起，与「情绪指标口径与输入数据」一致；
+    指数本身的读数与覆盖率在折叠区外，不受影响。
+    """
+    components = [c for c in view.components if c.in_index]
+    if not components:
+        return
+    with st.expander('指数分量（进入计算的最新取值）'):
+        for group, title, index_key in (
+            ('participation', '参与度指数', 'participation_index'),
+            ('direction', '方向指数', 'direction_index'),
+        ):
+            members = [c for c in components if c.group == group]
+            if not members:
+                continue
+            for column, info in zip(st.columns(len(members)), members, strict=True):
+                with column:
+                    st.metric(
+                        info.label,
+                        '不可用' if info.value is None else f'{info.value:.1f} / 100',
+                    )
+                    if info.value is None:
+                        st.caption('该分量当前不可用（字段缺失或样本不足）')
+                    else:
+                        st.caption(
+                            f'取值日期 {info.value_date.isoformat()}'
+                            + (f' · 组内权重 {info.weight_share:.0%}' if info.weight_share else '')
+                        )
+                    method = view.profile.get(info.name, '')
+                    if method:
+                        st.caption(
+                            f'口径：{method}' + (' · T+1 滞后使用' if info.availability_lag else '')
+                        )
+            index_value = snapshot.get(index_key)
+            st.caption(
+                f'{title} = {_composition_text(members, None if index_value is None else float(index_value))}'
+                '（权重按当日可用分量重归一；分量为 0—100 的分数或分位）'
+            )
+
+
+def _latest_text(value: object, *, digits: int = 1) -> str:
+    """最新读数的数字文案；缺失时返回「不可用」，不用 0 或前一日值顶替。"""
+    return '不可用' if value is None else f'{float(value):.{digits}f}'
+
+
+def _latest_metric(snapshot: dict, key: str, *, digits: int = 1) -> str:
+    """「x.x / 100」形式的最新读数，缺失时整个读数标为不可用。"""
+    value = snapshot.get(key)
+    return '不可用' if value is None else f'{float(value):.{digits}f} / 100'
+
+
+def _latest_gap_text(snapshot: dict) -> str:
+    """最新交易日「指数读数为空」时的说明；有读数就返回空串。
+
+    覆盖率不满不等于读数不可用：两融 T+1 公布，当日多半缺该分量，
+    参与度会按可用分量重归一退化成量比得分独占（权重 100%）——
+    这是每日常态，由卡片上的「可用分量覆盖率」体现，不在这里告警。
+    只有可用分量少到算不出指数（低于 min_index_coverage）时才提示，并点名缺了什么。
+    """
+    gaps: list[str] = []
+    for label, key, group in (
+        ('参与度指数', 'participation_index', 'participation'),
+        ('方向指数', 'direction_index', 'direction'),
+    ):
+        if snapshot.get(key) is not None:
+            continue
+        names = [*(snapshot.get(f'{group}_missing') or ())]
+        detail = '（缺 ' + '、'.join(component_label(name) for name in names) + '）' if names else ''
+        gaps.append(f'{label}{detail}')
+    if not gaps:
+        return ''
+    return (
+        f"最新交易日 {snapshot.get('as_of')} 的读数不可用：" + '、'.join(gaps)
+        + '，等待下次采集补齐。'
+    )
+
+
+def _panic_breakdown_text(snapshot: dict) -> str:
+    """恐慌分的命中 / 覆盖率 / 置信度；任一字段缺失时整行标为不可用。"""
+    coverage = snapshot.get('panic_coverage')
+    confidence = snapshot.get('panic_confidence')
+    hits = snapshot.get('panic_hits')
+    if coverage is None or confidence is None or hits is None:
+        return '命中与覆盖率：不可用（分量缺失）'
+    return (
+        f'命中 {hits} / 可评估 {float(coverage) * 5:.0f}'
+        f' · 覆盖率 {float(coverage):.0%}'
+        f' · 置信度 {float(confidence):.0%}'
+    )
+
+
 def render_sentiment_section(data: DashboardData, *, days: int | None, option: str) -> None:
     """A股市场情绪指标：指数、状态、恐慌分、反转观察、量价状态与曲线。"""
     view = build_sentiment_view(data.series, data.statuses)
@@ -375,20 +492,30 @@ def render_sentiment_section(data: DashboardData, *, days: int | None, option: s
     if not view.available:
         st.info(view.reason or '情绪指标未接通。')
     else:
+        gap_text = _latest_gap_text(snapshot)
+        if gap_text:
+            st.warning(gap_text)
         top_left, top_right = st.columns([2, 3])
         with top_left, st.container(border=True):
             st.markdown('<div class="card-title">四象限状态</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="card-value">{ctx["state_label"]}</div>', unsafe_allow_html=True)
             st.markdown(
-                f'<div class="card-sub">参与度 {float(snapshot["participation_index"]):.1f}'
+                f'<div class="card-sub">参与度 {_latest_text(snapshot.get("participation_index"))}'
                 f'（{ctx["participation_band_text"]}） · '
-                f'方向 {float(snapshot["direction_index"]):.1f}（{ctx["direction_band_text"]}）</div>',
+                f'方向 {_latest_text(snapshot.get("direction_index"))}'
+                f'（{ctx["direction_band_text"]}）</div>',
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f'<div class="muted">判定阈值 40 / 60：参与度与方向都高＝贪婪/主升，'
-                f'参与度高而方向低＝恐慌抛售（放量急跌型冰点），都低＝缩量阴跌（清淡型冰点），'
-                f'参与度低而方向高＝温和回暖，其余为中性震荡。<br>'
+                f'<div class="muted">{ctx["position_text"]}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div class="muted">判定阈值 40 / 60：参与度与方向都高＝放量上行，'
+                f'参与度高而方向低＝放量急跌，都低＝缩量回落，'
+                f'参与度低而方向高＝缩量回暖，其余为中性震荡。<br>'
+                f'同一象限在高位与低位含义不同：高位（上证指数收盘高于 60 日均线）'
+                f'是趋势末段的警惕，低位则多是冰点与抛压宣泄；位置不可用时按四象限基础口径显示。<br>'
                 f'数据日期 {view.as_of} · 已有读数 {view.used_rows} 个交易日</div>',
                 unsafe_allow_html=True,
             )
@@ -406,6 +533,7 @@ def render_sentiment_section(data: DashboardData, *, days: int | None, option: s
                 shown = points[-10:]
                 st.caption(
                     f'四象限位置：横轴参与度、纵轴方向（0—100，虚线为 40/60 阈值）· '
+                    f'点形表示价格位置：● 高位（上证指数收盘 > 60 日均线）、○ 低位、◇ 位置未知 · '
                     f'最近 {len(shown)} 个交易日，箭头由过去指向未来 · '
                     f'{shown[0][0].isoformat()} → {shown[-1][0].isoformat()}'
                 )
@@ -416,7 +544,7 @@ def render_sentiment_section(data: DashboardData, *, days: int | None, option: s
         with left:
             st.metric(
                 '综合情绪指数',
-                f"{float(snapshot['sentiment_index']):.1f} / 100",
+                _latest_metric(snapshot, 'sentiment_index'),
             )
             st.caption(
                 f"数据日期 {view.as_of} · 过去 {view.window} 个交易日分位"
@@ -427,20 +555,18 @@ def render_sentiment_section(data: DashboardData, *, days: int | None, option: s
                 )
             )
         with middle:
-            st.metric('参与度指数', f"{float(snapshot['participation_index']):.1f} / 100")
+            st.metric('参与度指数', _latest_metric(snapshot, 'participation_index'))
             st.caption(_coverage_text(snapshot, 'participation'))
         with right:
-            st.metric('方向指数', f"{float(snapshot['direction_index']):.1f} / 100")
+            st.metric('方向指数', _latest_metric(snapshot, 'direction_index'))
             st.caption(_coverage_text(snapshot, 'direction'))
+
+        render_index_components(view, snapshot)
 
         row = st.columns(3)
         with row[0]:
-            st.metric('恐慌抛售得分', f"{float(snapshot['panic_score']):.0f} / 100")
-            st.caption(
-                f"命中 {snapshot['panic_hits']} / 可评估 {float(snapshot['panic_coverage']) * 5:.0f}"
-                f" · 覆盖率 {float(snapshot['panic_coverage']):.0%}"
-                f" · 置信度 {float(snapshot['panic_confidence']):.0%}"
-            )
+            st.metric('恐慌抛售得分', _latest_metric(snapshot, 'panic_score', digits=0))
+            st.caption(_panic_breakdown_text(snapshot))
             st.caption(f"触发条件：{ctx['panic_text']}")
         with row[1]:
             st.metric('冰点反转观察', '满足' if snapshot['reversal_watch'] else '未触发')
@@ -456,24 +582,76 @@ def render_sentiment_section(data: DashboardData, *, days: int | None, option: s
             st.caption(f"数据质量：{ctx['quality_label']}")
 
     reference = beijing_today()
-    for column, spec in zip(st.columns(len(SENTIMENT_SPECS)), SENTIMENT_SPECS, strict=True):
-        series = view.curves.get(spec.key) or []
-        sliced, sampled, resolution, boundaries = prepare_curve(
-            series, days=days, option=option, reference=reference
+    # 上证指数取自库内原始序列（不参与任何合成，也不做位置判定以外的加工）；
+    # 三条指数曲线来自 sentiment_view 的组装结果。
+    series_by_key = {
+        **{spec.key: view.curves.get(spec.key) or [] for spec in SENTIMENT_SPECS},
+        SH_INDEX_SPEC.key: data.series.get(SH_INDEX_SPEC.key) or [],
+    }
+    sliced_by_spec = [
+        (spec, charts.slice_range(series_by_key[spec.key], days, now=reference))
+        for spec in SENTIMENT_CHART_SPECS
+    ]
+    # 四张图同列、共用一条时间轴，因此只能有一种分辨率（按各序列的整体跨度判定），
+    # 不能各自按自己的跨度选粒度——这正是「一个视图内统一分辨率」的要求。
+    resolution = charts.unified_resolution(option, [sliced for _spec, sliced in sliced_by_spec])
+    boundaries = (
+        charts.tiered_boundaries(reference) if resolution == charts.RESOLUTION_TIERED else None
+    )
+    curves = [
+        (spec, sliced, charts.resample(sliced, resolution, now=reference))
+        for spec, sliced in sliced_by_spec
+    ]
+    panels = [(spec, sampled, boundaries) for spec, _sliced, sampled in curves]
+    # 四张图都铺价格位置底色：逐日位置按**日期精确对齐**到每张图自己画出来的点上
+    # （位置与上证指数同一天，不做前向填充），再合并成连续背景带。各图点数与日期
+    # 可以不同，所以底色按各自的观测日分段，切换点落在该图自己的点上。
+    position_by_day = dict(view.positions)
+    bands = {
+        spec.key: charts.position_bands(
+            [
+                (day, position_by_day.get(day, codes.POS_UNKNOWN))
+                for day, _value in sampled
+            ]
         )
-        with column, st.container(border=True):
-            st.markdown(f'**{spec.title}**')
-            if not sampled:
-                st.caption('样本不足')
-                continue
-            figure = charts.build_figure(
-                sampled, spec, height=200, boundaries=boundaries, y_range=(0.0, 100.0)
+        for spec, _sliced, sampled in curves
+    }
+
+    with st.container(border=True):
+        if not any(sampled for _spec, _sliced, sampled in curves):
+            st.markdown('**上证指数 / 综合情绪 / 参与度 / 方向指数**')
+            st.caption('样本不足')
+        else:
+            st.plotly_chart(
+                charts.build_stacked_figure(panels, bands=bands),
+                width='stretch',
+                key='chart-sentiment-curves',
             )
-            st.plotly_chart(figure, width='stretch', key=f'chart-{spec.key}')
-            shown = f'{len(sampled)}/{len(sliced)}' if len(sampled) != len(sliced) else f'{len(sampled)}'
             st.caption(
-                f'最新 {charts.latest_text(sampled, spec)} · {resolution} · {shown} 点'
-                f' · 起点 {sampled[0][0].isoformat()}'
+                f'{resolution} · 一个视图内统一分辨率 · {len(panels)} 张图同列并共用一条时间轴：'
+                f'光标停在任意一张图上，一条竖线纵穿 {len(panels)} 张图，'
+                f'提示框同时给出 {len(panels)} 条曲线在该日期的取值'
+            )
+            starts = {sampled[0][0] for _spec, _sliced, sampled in curves if sampled}
+            st.caption(
+                '；'.join(
+                    f'{spec.title} {len(sampled)}/{len(sliced)} 点'
+                    f' · 起点 {sampled[0][0].isoformat()} → 最新 {sampled[-1][0].isoformat()}'
+                    for spec, sliced, sampled in curves
+                    if sampled
+                )
+                + (
+                    '（起点不同＝该序列确有更长的历史；缺口不补齐、不插值）'
+                    if len(starts) > 1
+                    else ''
+                )
+            )
+            st.caption(
+                '四张图的底色都＝价格位置（与曲线同粒度，每段取区间内最后一个真实观测）：'
+                '红底＝高位（上证指数当日收盘 > 60 日均线）、绿底＝低位（不高于均线）；'
+                '无底色＝位置未知（均线未满 60 个交易日或当日无上证指数观测）。'
+                '悬停时竖线纵穿四张图，横线只在光标所在的那张图内'
+                '（各图纵轴刻度不同，横线跨图会被误读）。位置只描述状态，不是买卖提示。'
             )
 
     with st.expander('情绪指标口径与输入数据'):
@@ -482,21 +660,65 @@ def render_sentiment_section(data: DashboardData, *, days: int | None, option: s
 **构造方式（等权，缺失分量跳过并标注覆盖率）**
 
 ```
-参与度指数 = 平均(换手率分位, 成交额分位, 量比分位, 融资净买入分位)
+参与度指数 = 0.5 × 量比得分 + 0.5 × 两融交易额20日分位
+量比得分   = 阈值映射：0.5 → 0、1.0 → 50、2.0 → 100（分段线性，两端截断）
 方向指数   = 平均(20日收益分位, MACD柱分位, 涨跌停比分位, 上涨家数占比分位)
 综合情绪   = 0.5 × 参与度指数 + 0.5 × 方向指数
 恐慌抛售得分 = 100 × 命中条件数 ÷ 可评估条件数（可评估数 < 3 时标不可用）
 ```
 
-- 分位窗口：过去 **{view.window} 个交易日**；口径 = **严格早于当日 + 中位秩**
-  （与股债利差分位同一排名公式，但窗口不同：这里按交易日滚动）。
+- 分位窗口：方向指数与综合情绪自身的分位用过去 **{view.window} 个交易日**；
+  参与度指数是固定口径（量比阈值映射 + 两融交易额 20 日分位），不随窗口旋钮变化。
+- 参与度只用**无符号量**：两融交易额 = 融资买入额 + 融资偿还额（同日相加，T+1 可得），
+  表达"杠杆资金有多活跃"；因此参与度轴不表达多空方向，与方向指数相互独立。
+- 两融**不取前一日的值顶替**：当日尚未（完整）公布时该分量按缺失处理，参与度指数只由量比得分
+  决定（权重 100%，覆盖率显示 0.5）。因此当日读数会在两融公布后按等权口径重算。
+- 两融**完整性校验**：两融交易额与净买入来自**同一份**「融资买入额 + 融资偿还额」观测，
+  源站只发布一部分时两者一起失真。因此当「两融交易额 ÷ 成交额」与前 20 个交易日该比值的
+  中位数、**以及**两融交易额与其自身历史中位数**同时**低于 0.7 倍时，判定该日发布不完整，
+  两个字段一并按缺失处理，不进入 20 日分位窗口（2026-09-24 实测：比值为前 20 日中位数的
+  0.49，其余交易日最低 0.83）。窗口与阈值是配置项，阈值设 0 即关闭该校验。
+- 口径 = **严格早于当日 + 中位秩**（与股债利差分位同一排名公式，但窗口按交易日滚动）。
 - `min_periods` 按窗口比例推导（252 天窗口 → 120 个有效样本）；样本未满窗口时只是"位置估计"，
   不称为「{view.window} 日分位」。
-- 分量尺度：{'；'.join(f'{name}={list(windows)}' for name, windows in view.profile.items())}。
+- 分量口径：{'；'.join(f'{name}={text}' for name, text in view.profile.items())}。
+- 换手率、成交额与融资净买入（有符号）照常采集与展示，但**不参与指数合成**
+  （换手率另用于恐慌抛售得分）。
 - 恐慌分只用**可评估**的条件（缺失条件不计入分母），并输出覆盖率与置信度；
   覆盖率低于 0.6 时不触发反转观察信号，页面会显示门控原因。
+- 状态 = **四象限 × 价格位置**：位置按上证指数**当日收盘价与其 60 日均线**比较，
+  收盘高于均线为高位、不高于为低位（恰好在均线上按低位处理，不声称"高于"）。
+  均线满 60 个交易日才生效、含当日、不做前向填充；样本不足或当日无上证指数观测时
+  位置显示为未知，状态退回四象限基础口径。
+- 位置判定是**独立于指数之外的描述**：它不参与参与度/方向/综合情绪指数，
+  也不影响恐慌分、覆盖率与数据质量。
 - 反转头号观察信号是状态描述，不是买入信号；本页不输出任何买卖指令、目标价或仓位建议。
-
+            """
+        )
+        st.markdown(
+            """
+**状态对照（四象限 × 价格位置）**
+            """
+        )
+        st.dataframe(state_reference_frame(), hide_index=True, width='stretch')
+        st.caption(
+            '高位＝上证指数收盘高于 60 日均线，低位＝不高于；'
+            '中性震荡与不可用不区分高低位（位置对它们不增加信息）。'
+            '文案只描述状态，不构成任何买卖提示。'
+        )
+        st.markdown(
+            """
+**指数分量（参与度 / 方向，逐分量取值与口径）**
+            """
+        )
+        st.dataframe(component_frame(view), hide_index=True, width='stretch')
+        st.caption(
+            '组内权重是「最新一日实际生效」的权重：不可用分量会被剔除后重归一，'
+            '因此与配置里的固定权重可能不同；取值日期是当日指数实际用到的取值日期'
+            '（T+1 分量的底层观测来自上一交易日）。'
+        )
+        st.markdown(
+            """
 **输入字段与数据日期**
             """
         )
@@ -558,7 +780,7 @@ def main() -> None:
                     st.rerun()
         else:
             st.caption(
-                '手动采集按钮已关闭（采集由每天 08:30 的定时任务执行）。'
+                '手动采集按钮已关闭（采集由每天 15:01 的定时任务执行）。'
                 '需要临时开启：设置环境变量 MACROBOARD_ENABLE_MANUAL_REFRESH=1 后重启服务。'
             )
 
@@ -570,10 +792,6 @@ def main() -> None:
     long_cards = [cards_by_key[key] for key in LONG_TERM_CARD_KEYS if key in cards_by_key]
 
     st.subheader('短线指标：A股市场情绪')
-    st.caption(
-        '情绪合成读数属于短线指标，默认 1 年以保留日线细节。本区块的「时间范围」与'
-        '「曲线粒度」只作用于情绪曲线，与下方市场宽度、长线指标各自独立。'
-    )
     sentiment_days, sentiment_option = render_range_controls('sentiment', default_range='1年')
     render_sentiment_section(data, days=sentiment_days, option=sentiment_option)
 

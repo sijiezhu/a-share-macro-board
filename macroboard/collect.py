@@ -118,6 +118,12 @@ def build_jobs(
         warnings = {'hs300_close': '; '.join(fetched.warnings)} if fetched.warnings else {}
         return JobOutcome({'hs300_close': fetched.rows}, warnings)
 
+    def sh_close() -> JobOutcome:
+        start = start_for(CHART_BACKFILL_YEARS, 400)
+        fetched = mx.fetch_sh_close(session, api_key or '', start, end)
+        warnings = {'sh_close': '; '.join(fetched.warnings)} if fetched.warnings else {}
+        return JobOutcome({'sh_close': fetched.rows}, warnings)
+
     def hs300_pe() -> JobOutcome:
         start = start_for(SPREAD_BACKFILL_YEARS, 400)
         fetched = mx.fetch_hs300_pe(session, api_key or '', start, end)
@@ -125,7 +131,7 @@ def build_jobs(
         return JobOutcome({'hs300_pe_ttm': fetched.rows}, warnings)
 
     def a_share_activity() -> JobOutcome:
-        """A股情绪算法的原始输入（成交额/成交量/换手率/涨跌停家数/融资净买入）。"""
+        """A股情绪算法的原始输入（成交额/成交量/换手率/涨跌停家数/两融）。"""
         start = start_for(CHART_BACKFILL_YEARS, 400)
         fetched = mx.fetch_a_share_activity(session, api_key or '', start, end)
         return JobOutcome(
@@ -140,10 +146,19 @@ def build_jobs(
         Job('黄金', ('xauusd',), xauusd),
         Job('A股涨跌家数', ('adv_count', 'dec_count', 'flat_count'), breadth, requires_mx=True),
         Job('沪深300指数', ('hs300_close',), hs300_close, requires_mx=True),
+        Job('上证指数', ('sh_close',), sh_close, requires_mx=True),
         Job('沪深300估值', ('hs300_pe_ttm',), hs300_pe, requires_mx=True),
         Job(
             'A股情绪输入',
-            ('amount', 'volume', 'turnover_rate', 'margin_net_buy', 'limit_up_count', 'limit_down_count'),
+            (
+                'amount',
+                'volume',
+                'turnover_rate',
+                'margin_net_buy',
+                'margin_turnover',
+                'limit_up_count',
+                'limit_down_count',
+            ),
             a_share_activity,
             requires_mx=True,
         ),

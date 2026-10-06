@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,8 +27,11 @@ from .config import (
 from .registry import (
     count_column,
     emitted_columns,
+    price_ma_column,
     primary_scale,
     scale_column,
+    score_column,
+    score_count_column,
     value_column,
 )
 
@@ -146,6 +149,67 @@ def rolling_percentile(
     if method == 'rank_inclusive':
         return rank_percentile(series, window, min_periods)
     raise ValueError(f'未知分位口径：{method!r}')
+
+
+def level_map_score(
+    series: pd.Series,
+    anchors: Sequence[tuple[float, float]],
+) -> pd.Series:
+    """阈值映射：按锚点把输入值分段线性映射到 0—100，超出两端截断。
+
+    与滚动分位不同：映射只看锚点，不看历史样本，因此不引入窗口、不产生样本外起点；
+    锚点之外的取值截断到端点分值（例如量比 <= 0.5 -> 0、>= 2.0 -> 100）。
+    缺失值保持缺失，不做前向填充。
+    """
+    if len(anchors) < 2:
+        raise ValueError(f'level_map 至少需要 2 个锚点，收到 {len(anchors)}')
+    xs = np.asarray([x for x, _ in anchors], dtype='float64')
+    ys = np.asarray([y for _, y in anchors], dtype='float64')
+    if np.any(np.diff(xs) <= 0):
+        raise ValueError(f'level_map 输入阈值必须严格递增，收到 {xs.tolist()}')
+    values = pd.to_numeric(series, errors='coerce').astype('float64')
+    array = values.to_numpy(dtype='float64', copy=False)
+    mapped = np.interp(array, xs, ys, left=float(ys[0]), right=float(ys[-1]))
+    mapped = np.clip(mapped, 0.0, 100.0)
+    mapped = np.where(np.isnan(array), np.nan, mapped)
+    return pd.Series(mapped, index=series.index, name=series.name)
+
+
+def level_map_component(
+    component: ComponentSpec,
+    lagged: pd.Series,
+    *,
+    ratio: float,
+    default_method: str,
+) -> tuple[pd.Series, pd.Series, ComponentMeta]:
+    """阈值映射分量的取值、有效样本计数与元信息。
+
+    取值只来自锚点（不取分位）；`scales` 在这里只用于有效样本计数与数据充分度，
+    因此计数列的语义与分位分量一致（窗口内有效观测数），但取值不随窗口变化。
+    """
+    score = level_map_score(lagged, component.level_map)
+    if component.sign == 'reverse':
+        score = 100.0 - score
+    score = score.rename(score_column(component.name, component.sign))
+    scale = primary_scale(component)
+    min_periods = resolve_min_periods(scale, resolve_method(scale, default_method), ratio)
+    count = lagged.rolling(scale.window, min_periods=1).count().rename(
+        score_count_column(component.name, component.sign)
+    )
+    meta = ComponentMeta(
+        name=component.name,
+        group=component.group,
+        sign=component.sign,
+        horizon=component.horizon,
+        source=component.source,
+        windows=(scale.window,),
+        weights=(float(scale.weight),),
+        min_periods=(min_periods,),
+        methods=('level_map',),
+        primary_window=scale.window,
+        availability_lag=component.availability_lag,
+    )
+    return score, count, meta
 
 
 # --- 基础指标 -----------------------------------------------------------------
@@ -276,6 +340,7 @@ def component_sources(frame: pd.DataFrame, base: pd.DataFrame, config: Sentiment
         'amount': _column(frame, 'amount'),
         'volume_ratio': base['volume_ratio'],
         'margin_net_buy': _column(frame, 'margin_net_buy'),
+        'margin_turnover': _column(frame, 'margin_turnover'),
         'return': base[primary_return],
         'macd_hist_norm': base['macd_hist_norm'],
         'limit_up_down_ratio': base['limit_up_down_ratio'],
@@ -303,6 +368,12 @@ def compute_base(frame: pd.DataFrame, config: SentimentConfig) -> pd.DataFrame:
     )
     base = pd.DataFrame(index=frame.index)
     base['volume_ratio'] = volume_ratio(_column(frame, 'volume'), windows.volume_ma)
+    # 价格位置用的均线：满窗口、不做前向填充与插值（缺一日 -> 其后 window 行均为 NaN）。
+    # 用 `sh_close`（上证指数）而非 `close`（沪深300）：位置口径与方向指数是两个标的。
+    price = _column(frame, 'sh_close')
+    price_ma = price.rolling(int(windows.price_ma_window), min_periods=int(windows.price_ma_window)).mean()
+    base[price_ma_column(int(windows.price_ma_window))] = price_ma
+    base['price_ma_gap'] = price / price_ma.where(price_ma > 0) - 1.0
     for horizon in windows.return_horizons:
         column = f'return_{int(horizon)}d'
         base[column] = return_series(_column(frame, 'close'), int(horizon))
@@ -333,6 +404,20 @@ def compute_features(frame: pd.DataFrame, config: SentimentConfig | None = None)
                 f'可用来源：{available}'
             ) from exc
         lagged = series.shift(component.availability_lag) if component.availability_lag else series
+        if component.transform == 'level_map':
+            score, count, component_meta = level_map_component(
+                component,
+                lagged,
+                ratio=ratio,
+                default_method=cfg.quality.percentile_method,
+            )
+            columns[score.name] = score
+            columns[count.name] = count
+            values[component.name] = score
+            counts[component.name] = count
+            partial[component.name] = pd.Series(False, index=frame.index, dtype=bool)
+            meta[component.name] = component_meta
+            continue
         results: dict[int, ScaleResult] = {}
         methods: list[str] = []
         mins: list[int] = []

@@ -3,7 +3,11 @@
 口径
 - 只做无效值剔除，不做插值；默认也**不做前向填充**（`missing_policy='nan'`）。
 - `volume == 0`（停牌）默认按缺失处理；`amount == 0` 视为真实极端缩量保留。
-- `margin_net_buy` 是有符号流量，允许为负。
+- `margin_net_buy` 是有符号流量，允许为负（不参与指数合成，仅采集与展示）。
+- `margin_turnover`（融资买入额 + 融资偿还额）必须非负，负值视为非法值置为缺失。
+- **两融完整性校验**：同一份「融资买入额 + 融资偿还额」观测若源站只发布了一部分，
+  当日两个两融字段会一起偏低；命中校验的观测日把 `margin_turnover` 与 `margin_net_buy`
+  **一并**置为缺失（同源双侧观测，不拆开、不取邻近值顶替），详见 `_exclude_incomplete_margin`。
 - 缺失列默认按"不可用"处理（`on_missing_column='mark'`），不会抛异常。
 """
 
@@ -16,15 +20,17 @@ import numpy as np
 import pandas as pd
 
 from . import codes
-from .config import SentimentConfig, validate_config
+from .config import SentimentConfig, derive_min_periods, validate_config
 
-# 12 个输入字段中的 11 个数值列（date 单独处理）
+# 14 个输入字段中的 13 个数值列（date 单独处理）
 SUPPORTED_NUMERIC_COLUMNS: tuple[str, ...] = (
     'close',
+    'sh_close',
     'volume',
     'amount',
     'turnover_rate',
     'margin_net_buy',
+    'margin_turnover',
     'up_count',
     'down_count',
     'limit_up_count',
@@ -34,16 +40,31 @@ SUPPORTED_NUMERIC_COLUMNS: tuple[str, ...] = (
 )
 
 # 必须为正 / 必须非负的列（margin_net_buy 不在此列：允许为负）
-POSITIVE_COLUMNS: tuple[str, ...] = ('close', 'pcr', 'implied_volatility')
+POSITIVE_COLUMNS: tuple[str, ...] = ('close', 'sh_close', 'pcr', 'implied_volatility')
 NON_NEGATIVE_COLUMNS: tuple[str, ...] = (
     'volume',
     'amount',
     'turnover_rate',
+    'margin_turnover',
     'up_count',
     'down_count',
     'limit_up_count',
     'limit_down_count',
 )
+
+# 两融完整性校验作用的两列：同一份双侧观测解析出的两个字段，同源发布，必须成对剔除。
+MARGIN_COMPLETENESS_COLUMNS: tuple[str, ...] = ('margin_turnover', 'margin_net_buy')
+
+
+@dataclass(frozen=True, slots=True)
+class MarginCompletenessDrop:
+    """被两融完整性校验剔除的一个观测日（告警与页面据此说明原因）。"""
+
+    day: pd.Timestamp
+    ratio: float  # 当日 两融交易额 ÷ 成交额
+    ratio_reference: float  # 前 window 个交易日该比值的中位数（严格早于当日）
+    margin_reference: float  # 前 window 个交易日两融交易额的中位数（严格早于当日）
+    threshold: float  # 触发阈值：两个比值同时 < threshold
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +74,7 @@ class NormalizedInput:
     dropped_counts: Mapping[str, int]
     original_columns: tuple[str, ...]
     missing_columns: tuple[str, ...]
+    margin_completeness: tuple[MarginCompletenessDrop, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +171,19 @@ def normalize_frame(df: pd.DataFrame, config: SentimentConfig | None = None) -> 
         if filled:
             warnings.append(f'按 ffill 白名单填充：{", ".join(filled)}')
 
+    # 两融完整性校验放在 ffill 之后、winsorize 之前：判定是终局，
+    # 不允许被白名单前向填充翻案（用上一日的值补当日，正是本项目对两融明确禁止的"顶替"）。
+    frame, margin_completeness = _exclude_incomplete_margin(frame, cfg)
+    if margin_completeness:
+        for column in MARGIN_COMPLETENESS_COLUMNS:
+            dropped[column] = dropped.get(column, 0) + len(margin_completeness)
+        warnings.append(
+            margin_completeness_warning(
+                margin_completeness,
+                window=int(cfg.quality.margin_completeness_window),
+            )
+        )
+
     if cfg.quality.winsorize_enabled:
         frame = _winsorize(frame, cfg)
         warnings.append(
@@ -162,6 +197,7 @@ def normalize_frame(df: pd.DataFrame, config: SentimentConfig | None = None) -> 
         dropped_counts=dropped,
         original_columns=original_columns,
         missing_columns=missing,
+        margin_completeness=margin_completeness,
     )
 
 
@@ -191,6 +227,83 @@ def _winsorize(frame: pd.DataFrame, cfg: SentimentConfig) -> pd.DataFrame:
         upper = series.rolling(window, min_periods=2).quantile(upper_q)
         out[col] = series.clip(lower=lower, upper=upper)
     return out
+
+
+def _exclude_incomplete_margin(
+    frame: pd.DataFrame,
+    cfg: SentimentConfig,
+) -> tuple[pd.DataFrame, tuple[MarginCompletenessDrop, ...]]:
+    """两融完整性校验：比值与自身量级同时异常偏低的一日，两个两融字段整对置为缺失。
+
+    口径理由（2026-09-27，实例见 `docs/DATA_SOURCES.md` 的两融条目）
+    - 两融交易额与净买入来自**同一份**「融资买入额 + 融资偿还额」观测，源站只发布一部分时
+      两者一起失真，因此成对剔除；不取邻近值顶替（与"不用 T−1 值顶替"同一条理由）。
+    - 参照只用历史（`shift(1).rolling(...)`，严格早于当日），因此不引入未来函数。
+    - **两条条件同时成立**才剔除，缺一不可：
+        1) 相对成交额偏低 —— 杠杆活跃度相对大盘异常萎缩；
+        2) 相对自身历史偏低 —— 两融交易额的量级也确实掉了。
+      只留条件 1 会把「成交额骤增、两融尚未同步放大」的放量日（如恐慌放量）误判为发布不完整；
+      只留条件 2 会在全市场杠杆活跃度整体降温时误伤（真实库实测有 0.57 的日子）。
+    - `amount` 缺失或为 0 时不判定：没有分母就无从判断"占比是否异常"，
+      宁可保留也不误剔除（`amount == 0` 在 §3.1 是真实的极端缩量，不是无效值）。
+    - 判定是**相对**的而非绝对水平：整段区间都发布不完整时参照本身也低，不会命中；
+      该情形靠 `docs/DATA_SOURCES.md` 的量级复核（成交额占比区间）人工发现。
+    """
+    quality = cfg.quality
+    window = int(quality.margin_completeness_window)
+    threshold = float(quality.margin_completeness_threshold)
+    if threshold <= 0:  # 阈值 0 视为关闭校验
+        return frame, ()
+    amount = pd.to_numeric(frame['amount'], errors='coerce')
+    margin = pd.to_numeric(frame['margin_turnover'], errors='coerce')
+    # amount <= 0 的位置必须屏蔽，否则 0 除产生的 inf 会污染中位数参照
+    ratio = (margin / amount.where(amount > 0)).replace([np.inf, -np.inf], np.nan)
+    min_periods = derive_min_periods(window, cfg.windows.min_periods_ratio)
+    ratio_reference = ratio.shift(1).rolling(window, min_periods=min_periods).median()
+    margin_reference = margin.shift(1).rolling(window, min_periods=min_periods).median()
+    hit = (
+        ratio.notna()
+        & ratio_reference.notna()
+        & (ratio < ratio_reference * threshold)
+        & margin_reference.notna()
+        & (margin < margin_reference * threshold)
+    )
+    if not bool(hit.any()):
+        return frame, ()
+    drops = tuple(
+        MarginCompletenessDrop(
+            day=pd.Timestamp(frame['date'].iloc[position]),
+            ratio=float(ratio.iloc[position]),
+            ratio_reference=float(ratio_reference.iloc[position]),
+            margin_reference=float(margin_reference.iloc[position]),
+            threshold=threshold,
+        )
+        for position in np.flatnonzero(hit.to_numpy())
+    )
+    out = frame.copy()
+    for column in MARGIN_COMPLETENESS_COLUMNS:
+        out[column] = out[column].mask(hit)
+    return out, drops
+
+
+def margin_completeness_warning(
+    drops: tuple[MarginCompletenessDrop, ...],
+    *,
+    window: int,
+    limit: int = 3,
+) -> str:
+    """把剔除结果写成一条中文说明（日期 + 比值 + 参照），供告警与页面复用。"""
+    detail = '；'.join(
+        f'{item.day.strftime("%Y-%m-%d")}（两融交易额÷成交额 = {item.ratio:.4f}，'
+        f'低于前 {window} 个交易日中位数 {item.ratio_reference:.4f} 的 {item.threshold:g} 倍，'
+        f'且两融交易额低于自身中位数 {item.margin_reference:.4g} 的 {item.threshold:g} 倍）'
+        for item in drops[:limit]
+    )
+    tail = f' 等共 {len(drops)} 天' if len(drops) > limit else ''
+    return (
+        f'两融完整性校验剔除 {len(drops)} 个观测日：{detail}{tail}'
+        '（同一份双侧观测，margin_turnover 与 margin_net_buy 一并按缺失处理）。'
+    )
 
 
 def profile_columns(normalized: NormalizedInput, *, min_samples: int | None = None) -> AvailabilityReport:

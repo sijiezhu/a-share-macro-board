@@ -19,10 +19,11 @@ from .features import ComponentMeta, FeatureBundle, compute_features
 from .inputs import (
     SUPPORTED_NUMERIC_COLUMNS,
     AvailabilityReport,
+    MarginCompletenessDrop,
     normalize_frame,
     profile_columns,
 )
-from .registry import default_config, emitted_columns
+from .registry import default_config, emitted_columns, price_ma_column
 from .scoring import ScoreBundle, score_all
 
 REQUIRED_COLUMNS: tuple[str, ...] = ('date',)
@@ -37,6 +38,7 @@ class SentimentResult:
     warnings: tuple[str, ...]
     as_of: pd.Timestamp | None
     config: SentimentConfig
+    margin_completeness: tuple[MarginCompletenessDrop, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         """JSON 友好的摘要（用于缓存/序列化），不含任何建议性字段。"""
@@ -47,6 +49,16 @@ class SentimentResult:
             'unavailable_columns': list(self.availability.unavailable),
             'latest': sentiment_snapshot(self.frame, self.config),
             'config': self.config.to_dict(),
+            'margin_completeness': [
+                {
+                    'day': item.day.strftime('%Y-%m-%d'),
+                    'ratio': item.ratio,
+                    'ratio_reference': item.ratio_reference,
+                    'margin_reference': item.margin_reference,
+                    'threshold': item.threshold,
+                }
+                for item in self.margin_completeness
+            ],
         }
 
 
@@ -73,11 +85,14 @@ def output_columns(config: SentimentConfig | None = None) -> tuple[str, ...]:
         'participation_missing',
         'direction_missing',
         'state',
+        'sh_close',
+        'price_position',
         'participation_band',
         'direction_band',
     ]
     if quality.include_labels:
         columns.append('state_label')
+        columns.append('price_position_label')
     columns += [
         'panic_score',
         'panic_hits',
@@ -103,6 +118,8 @@ def output_columns(config: SentimentConfig | None = None) -> tuple[str, ...]:
         'macd_hist',
         'macd_hist_norm',
         'volume_ratio',
+        price_ma_column(int(windows.price_ma_window)),
+        'price_ma_gap',
     ]
     columns += [f'return_{int(h)}d' for h in windows.return_horizons]
     columns += [
@@ -145,6 +162,7 @@ def analyze(df: pd.DataFrame, config: SentimentConfig | None = None) -> Sentimen
         warnings=tuple(warnings),
         as_of=None if frame.empty else pd.Timestamp(frame['date'].iloc[-1]),
         config=cfg,
+        margin_completeness=normalized.margin_completeness,
     )
 
 
@@ -172,6 +190,9 @@ def _assemble(
 
     if cfg.quality.include_labels:
         data['state_label'] = labels.label_series(data['state'], labels.STATE_LABELS)
+        data['price_position_label'] = labels.label_series(
+            data['price_position'], labels.POSITION_LABELS
+        )
         data['macd_volume_state_label'] = labels.label_series(
             data['macd_volume_state'], labels.MACD_VOL_STATE_LABELS
         )
@@ -193,11 +214,27 @@ def sentiment_snapshot(
 ) -> dict[str, object]:
     """最新一个交易日的摘要，供页面卡片直接使用（无任何建议性字段）。"""
     if frame is None or len(frame) == 0:
-        return {'as_of': None, 'rows': 0, 'state': codes.STATE_UNAVAILABLE,
-                'state_label': labels.STATE_LABELS[codes.STATE_UNAVAILABLE]}
+        return {
+            'as_of': None,
+            'rows': 0,
+            'state': codes.STATE_UNAVAILABLE,
+            'state_label': labels.STATE_LABELS[codes.STATE_UNAVAILABLE],
+            'price_position': codes.POS_UNKNOWN,
+            'price_position_label': labels.POSITION_LABELS[codes.POS_UNKNOWN],
+            'sh_close': None,
+            'price_ma': None,
+            'price_ma_column': None,
+            'price_ma_window': None,
+            'price_ma_gap': None,
+        }
     last = frame.iloc[-1]
     pct_columns = [name for name in frame.columns if name.startswith('sentiment_pct_')]
     sentiment_pct_column = pct_columns[0] if pct_columns else None
+    # 均线列名带窗口后缀（price_ma_60）；config 缺省时从列名反查，排除乖离列 price_ma_gap
+    ma_columns = [
+        name for name in frame.columns if name.startswith('price_ma_') and name != 'price_ma_gap'
+    ]
+    price_ma_column_name = ma_columns[0] if ma_columns else None
     snapshot: dict[str, object] = {
         'as_of': pd.Timestamp(last['date']).strftime('%Y-%m-%d'),
         'rows': int(len(frame)),
@@ -212,6 +249,15 @@ def sentiment_snapshot(
         'direction_missing': list(last.get('direction_missing') or ()),
         'state': last.get('state'),
         'state_label': labels.STATE_LABELS.get(str(last.get('state')), str(last.get('state'))),
+        'price_position': last.get('price_position'),
+        'price_position_label': labels.POSITION_LABELS.get(
+            str(last.get('price_position')), str(last.get('price_position'))
+        ),
+        'sh_close': _maybe_float(last.get('sh_close')),
+        'price_ma': _maybe_float(last.get(price_ma_column_name)),
+        'price_ma_column': price_ma_column_name,
+        'price_ma_window': int(config.windows.price_ma_window) if config is not None else None,
+        'price_ma_gap': _maybe_float(last.get('price_ma_gap')),
         'participation_band': last.get('participation_band'),
         'direction_band': last.get('direction_band'),
         'panic_score': _maybe_float(last.get('panic_score')),

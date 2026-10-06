@@ -6,7 +6,7 @@
 | --- | --- |
 | `macroboard-web.service` | Streamlit 页面，监听 `0.0.0.0:8501`（局域网可访问），崩溃自动拉起 |
 | `macroboard-update.service` | 单次数据采集（`update_data.py --quiet`） |
-| `macroboard-update.timer` | 每天 08:30（Asia/Shanghai）触发上面那个 service，错过的会在开机后补跑 |
+| `macroboard-update.timer` | 每天 15:01 与 20:30（Asia/Shanghai）各触发上面那个 service 一次（15:01 取收盘数据，20:30 补采源站发布较晚的序列），错过的会在开机后补跑 |
 
 ## 安装
 
@@ -35,6 +35,29 @@ journalctl --user -u macroboard-update -n 30 --no-pager
 # 手动触发一次采集（与定时任务走同一条路径，会消耗妙想调用次数）
 systemctl --user start macroboard-update.service
 ```
+
+## 改完代码必须重启页面服务（否则页面继续跑旧代码）
+
+```bash
+systemctl --user restart macroboard-web.service
+```
+
+`app.py` 本身每次交互都会重新读盘，但**它 import 的 `macroboard.*` 模块不会**：
+Python 把已导入的模块留在 `sys.modules`，Streamlit 只重跑 `app.py`，
+不会重新导入被改动的包；`--server.fileWatcherType none` 也关掉了自动重载。
+因此改算法/图表/配置后不重启，页面会一直用**进程启动那一刻**的旧代码，
+而且**同一个页面内部是自洽的**（卡片、曲线、象限图用的是同一份旧数据），
+不会报错、不会显示异常——只会安静地给出旧口径的数值。
+
+排查方法：比对模块文件时间与服务进程启动时间，前者更晚就说明服务是旧的：
+
+```bash
+stat -c '%y  %n' macroboard/sentiment/registry.py app.py
+systemctl --user show macroboard-web.service -p ActiveEnterTimestamp --no-pager
+```
+
+（2026-09-23 实例：改 `registry.py` 后未重启，象限图的参与度一直停在旧的 70.0，
+最新点跨过 60 阈值落在高参与度色块里；重启后回到 44.9。）
 
 ## 局域网访问（重要）
 
@@ -70,7 +93,7 @@ CIDR 是"网段"而不是"本机地址"。想收窄暴露面，能选的是下�
 页面没有登录鉴权，同网段任何设备都能看到库里全部数据（全部指标历史）。
 **会写入/消耗配额的动作已默认关闭**：手动「立即采集一次」按钮需要显式设置
 `Environment=MACROBOARD_ENABLE_MANUAL_REFRESH=1` 才会出现（默认关闭，见 `app.py`），
-日常采集由每天 08:30 的 timer 触发。
+日常采集由每天 15:01 与 20:30 的 timer 触发。
 
 页面自身唯一的写入是本机访问统计（页脚显示的人次与匿名独立访客），写在
 `data/visits.sqlite3`（与行情库分开；存 `SHA-256(盐 + IP + User-Agent)` 指纹、

@@ -13,8 +13,29 @@ from dateutil.relativedelta import relativedelta
 from macroboard import collect as collect_module
 from macroboard import db
 from macroboard.config import LOOKBACK_DAYS, SERIES
+from macroboard.sources import mx
 
 FRIDAY = date(2026, 9, 18)
+
+
+def _mx_payload(rows: list[tuple[str, float]]) -> dict:
+    """妙想返回的最小 payload（单指标列，rawTable 形态与线上一致）。"""
+    return {
+        'data': {
+            'data': {
+                'searchDataResultDTO': {
+                    'dataTableDTOList': [
+                        {
+                            'rawTable': {
+                                '325898': [str(value) for _day, value in rows],
+                                'headName': [f'{day}(日)' for day, _value in rows],
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }
 
 
 def _job(metrics, payload_or_error):
@@ -126,6 +147,7 @@ SENTIMENT_METRICS = (
     'volume',
     'turnover_rate',
     'margin_net_buy',
+    'margin_turnover',
     'limit_up_count',
     'limit_down_count',
 )
@@ -156,6 +178,27 @@ class SentimentInputJobTests(unittest.TestCase):
             with self.subTest(metric=metric):
                 self.assertIn(metric, SERIES)
                 self.assertIn(metric, LOOKBACK_DAYS)
+
+    def test_build_jobs_wires_sh_close(self):
+        """上证指数是位置判定的输入：必须登记序列、回补窗口与采集作业。"""
+        jobs = collect_module.build_jobs(session=object(), today=FRIDAY, full=False, api_key='test')
+        by_name = {job.name: job for job in jobs}
+        self.assertIn('上证指数', by_name)
+        job = by_name['上证指数']
+        self.assertEqual(job.metrics, ('sh_close',))
+        self.assertTrue(job.requires_mx)
+        self.assertIn('sh_close', SERIES)
+        self.assertIn('sh_close', LOOKBACK_DAYS)
+        self.assertEqual(SERIES['sh_close'].unit, '点')
+
+    def test_sh_close_is_fetched_through_the_mx_query(self):
+        with mock.patch.object(
+            mx, 'query', return_value=_mx_payload([('2025-01-02', 3262.5607)])
+        ) as patched:
+            session = mock.MagicMock()
+            fetched = mx.fetch_sh_close(session, 'key', date(2025, 1, 1), date(2025, 12, 31))
+        self.assertEqual(fetched.rows, [(date(2025, 1, 2), 3262.5607)])
+        self.assertIn('上证指数收盘价', patched.call_args.args[2])
 
     def test_partial_failure_marks_only_the_failed_metric(self):
         outcome = collect_module.JobOutcome(

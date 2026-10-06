@@ -25,6 +25,7 @@ from .config import (
     validate_config,
 )
 from .features import ComponentMeta, FeatureBundle, compute_features, rolling_percentile
+from .registry import price_ma_column
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +86,12 @@ def _to_float(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors='coerce').astype('float64')
 
 
+def _to_code(series: pd.Series, *, index: pd.Index) -> pd.Series:
+    """码值列对齐到目标索引；缺失位置（含索引外的行）一律按 POS_UNKNOWN 处理。"""
+    aligned = series.reindex(index) if isinstance(series, pd.Series) else pd.Series(series, index=index)
+    return aligned.astype('object').fillna(codes.POS_UNKNOWN)
+
+
 def missing_components(
     values: Mapping[str, pd.Series],
     specs: Sequence[ComponentSpec],
@@ -142,12 +149,60 @@ def index_band(values: pd.Series, *, low: float, high: float) -> pd.Series:
     return band
 
 
+def classify_position(close: pd.Series, price_ma: pd.Series) -> pd.Series:
+    """价格位置码：收盘 > 均线 -> POS_HIGH；<= 均线 -> POS_LOW；任一缺失 -> POS_UNKNOWN。
+
+    严格不等式：恰好落在均线上按低位处理（不声称"高于"均线）。
+    永远返回码值、不返回 NaN，便于下游直接合成状态。
+    """
+    price = _to_float(close)
+    average = _to_float(price_ma)
+    usable = price.notna() & average.notna() & (average > 0)
+    position = pd.Series(codes.POS_UNKNOWN, index=price.index, dtype='object')
+    position = position.mask(usable & (price > average), codes.POS_HIGH)
+    position = position.mask(usable & (price <= average), codes.POS_LOW)
+    return position
+
+
+# 四象限基础状态 × 价格位置 -> 复合状态码（ASCII 码值，文案在 labels.py）
+STATE_COMBINATIONS: tuple[tuple[str, str, str], ...] = (
+    (codes.STATE_GREED, codes.POS_HIGH, codes.STATE_GREED_HIGH),
+    (codes.STATE_GREED, codes.POS_LOW, codes.STATE_GREED_LOW),
+    (codes.STATE_PANIC, codes.POS_HIGH, codes.STATE_PANIC_HIGH),
+    (codes.STATE_PANIC, codes.POS_LOW, codes.STATE_PANIC_LOW),
+    (codes.STATE_COLD, codes.POS_HIGH, codes.STATE_COLD_HIGH),
+    (codes.STATE_COLD, codes.POS_LOW, codes.STATE_COLD_LOW),
+    (codes.STATE_THAW, codes.POS_HIGH, codes.STATE_THAW_HIGH),
+    (codes.STATE_THAW, codes.POS_LOW, codes.STATE_THAW_LOW),
+)
+
+
+def compose_state(shape: pd.Series, position: pd.Series) -> pd.Series:
+    """四象限基础状态 × 价格位置 -> 复合状态码。
+
+    `STATE_NEUTRAL` / `STATE_UNAVAILABLE` 不拆分（位置对它们不增加信息），
+    位置未知时保留四象限基础码。
+    """
+    mapping = {(base, pos): combined for base, pos, combined in STATE_COMBINATIONS}
+    keys = pd.Series(
+        [(base, pos) for base, pos in zip(shape, position, strict=True)],
+        index=shape.index,
+        dtype='object',
+    )
+    return keys.map(mapping).fillna(shape).astype('object')
+
+
 def classify_state(
     participation_index: pd.Series,
     direction_index: pd.Series,
     thresholds: SentimentThresholds,
+    position: pd.Series | None = None,
 ) -> pd.Series:
-    """四象限状态码；边界值（恰好 60/40）落在 STATE_NEUTRAL。"""
+    """四象限状态码；边界值（恰好 60/40）落在 STATE_NEUTRAL。
+
+    `position` 缺省为 None（等价于全部位置未知）-> 只出四象限基础码，
+    与加入位置维度之前的结果逐行一致。
+    """
     participation = _to_float(participation_index)
     direction = _to_float(direction_index)
     usable = participation.notna() & direction.notna()
@@ -169,7 +224,9 @@ def classify_state(
         usable & (participation < thresholds.low_participation) & (direction > thresholds.high_direction),
         codes.STATE_THAW,
     )
-    return state
+    if position is None:
+        return state
+    return compose_state(state, _to_code(position, index=state.index))
 
 
 def panic_metrics(
@@ -380,7 +437,10 @@ def score_all(
     base = features.base
     warnings: list[str] = []
 
-    participation_specs = [c for c in cfg.quality.components if c.group == 'participation']
+    # 只有 in_index=True 的分量进入指数：换手率/成交额照常计算，但不参与合成。
+    participation_specs = [
+        c for c in cfg.quality.components if c.group == 'participation' and c.in_index
+    ]
     direction_specs = [c for c in cfg.quality.components if c.group == 'direction']
     participation = compose_index(
         features.values, participation_specs, min_coverage=cfg.quality.min_index_coverage
@@ -404,7 +464,11 @@ def score_all(
     sentiment_pct, _ = rolling_percentile(sentiment_index, sentiment_scale.window, min_periods, method)
 
     momentum_windows = cfg.windows.momentum
-    state = classify_state(participation.value, direction.value, cfg.thresholds)
+    position = classify_position(
+        _frame_column(frame, 'sh_close'),
+        base[price_ma_column(int(cfg.windows.price_ma_window))],
+    )
+    state = classify_state(participation.value, direction.value, cfg.thresholds, position=position)
     participation_band = index_band(
         participation.value, low=cfg.thresholds.low_participation, high=cfg.thresholds.high_participation
     )
@@ -462,6 +526,8 @@ def score_all(
         'participation_missing': missing_components(features.values, participation_specs),
         'direction_missing': missing_components(features.values, direction_specs),
         'state': state,
+        'sh_close': _frame_column(frame, 'sh_close'),
+        'price_position': position,
         'participation_band': participation_band,
         'direction_band': direction_band,
         'panic_score': panic.score,

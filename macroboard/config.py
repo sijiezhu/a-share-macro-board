@@ -84,7 +84,11 @@ SERIES: dict[str, SeriesSpec] = {
         source_detail='LBMA Gold Price PM 定盘价，报价时点 15:00 伦敦时间（Europe/London），美元/金衡盎司',
         change_kind='pct',
         max_lag_days=7,
-        note='现货定盘参考价，不是期货价；周末与英国假日无报价。日线边界为伦敦交易日。',
+        note=(
+            '现货定盘参考价，不是期货价；周末与英国假日无报价。日线边界为伦敦交易日。'
+            '站点走海外链路（Cloudflare），晚间链路拥塞时可能瞬时连接超时：'
+            '采集侧用更短的建连超时 + 更多次尝试重试，口径不变。'
+        ),
     ),
     'adv_count': SeriesSpec(
         key='adv_count',
@@ -121,6 +125,16 @@ SERIES: dict[str, SeriesSpec] = {
         source_detail='沪深300指数(399300.SZ) 收盘价',
         change_kind='pct',
         max_lag_days=10,
+    ),
+    'sh_close': SeriesSpec(
+        key='sh_close',
+        label='上证指数收盘点位',
+        unit='点',
+        source='东方财富妙想数据',
+        source_detail='上证指数(000001.SH) 收盘价',
+        change_kind='pct',
+        max_lag_days=10,
+        note='用于判定高位/低位（当日收盘 vs 60 日均线），不参与任何指数合成。',
     ),
     'hs300_pe_ttm': SeriesSpec(
         key='hs300_pe_ttm',
@@ -171,7 +185,29 @@ SERIES: dict[str, SeriesSpec] = {
         source_detail='融资买入额 − 融资偿还额，两者按同一数据日期相减（不做前向填充）',
         change_kind='abs',
         max_lag_days=12,
-        note='两融数据 T+1 公布，情绪算法默认按 availability_lag=1 使用；可为负值。',
+        note=(
+            '两融数据 T+1 公布；可为负值。不参与指数合成（保留采集与展示，供对照）。'
+            '与 margin_turnover 同源：两融发布不完整时两者一并按缺失处理。'
+        ),
+    ),
+    'margin_turnover': SeriesSpec(
+        key='margin_turnover',
+        label='两融交易额（融资买入 + 融资偿还，两市合计）',
+        unit='元',
+        source='东方财富妙想数据',
+        source_detail=(
+            '融资买入额 + 融资偿还额，两者按同一数据日期相加'
+            '（仅同日双侧均有观测才计算，不做前向填充）'
+        ),
+        change_kind='abs',
+        max_lag_days=12,
+        note=(
+            '参与度分量（无符号活跃度，与净买入共用同一份原始观测）；'
+            '两融数据 T+1 公布：情绪算法不使用前一日的值顶替（availability_lag=0），'
+            '当日尚未（完整）发布时该分量按缺失处理，参与度指数只由量比得分决定（权重 100%）。'
+            '源站只发布部分观测时（两融交易额 ÷ 成交额与交易额自身同时异常偏低），'
+            '该日与 margin_net_buy 一并按缺失处理（完整性校验，见 docs/SENTIMENT_ALGORITHM.md）。'
+        ),
     ),
     'limit_up_count': SeriesSpec(
         key='limit_up_count',
@@ -196,6 +232,9 @@ SERIES: dict[str, SeriesSpec] = {
 }
 
 # 采集参数
+# 登记表：记录每个指标"至少需要多少天历史"，供测试核对作业与序列是否配套。
+# 实际增量窗口由 collect.py 的 `start_for(回补年限, 400)` 决定（多为 400 天）；
+# `hs300_close` 的 120 是早期遗留值，未随窗口调整，保留以不改变既有行为。
 LOOKBACK_DAYS = {
     'us10y': 400,        # 覆盖跨年比较
     'cn10y': 400,
@@ -203,11 +242,13 @@ LOOKBACK_DAYS = {
     'xauusd': 400,
     'a_share_sentiment': 30,
     'hs300_close': 120,
+    'sh_close': 400,
     'hs300_pe_ttm': 60,
     'amount': 400,
     'volume': 400,
     'turnover_rate': 400,
     'margin_net_buy': 400,
+    'margin_turnover': 400,
     'limit_up_count': 400,
     'limit_down_count': 400,
 }

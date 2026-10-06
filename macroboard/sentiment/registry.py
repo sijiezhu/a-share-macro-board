@@ -1,13 +1,19 @@
 """分量注册表：默认（规格书）配置与推荐的多尺度画像。
 
-默认画像 = 全部 252 日单尺度，数值与规格书一致；
-PROFILE_MULTISCALE_SUGGESTED 把快变量（涨跌停比、家数占比、量比）同时看短尺度与中尺度，
+默认画像的方向分量 = 252 日单尺度，数值与规格书一致；
+PROFILE_MULTISCALE_SUGGESTED 把快变量（涨跌停比、家数占比）同时看短尺度与中尺度，
 属于待评审的建议值，不会自动生效。
+
+参与度指数是固定口径（不随窗口旋钮变化）：
+  参与度指数 = 0.5 × 量比得分（阈值映射）+ 0.5 × 两融交易额 20 日分位
+两融交易额 = 融资买入额 + 融资偿还额（无符号），所以参与度轴不表达多空方向；
+净买入（有符号）仍照常采集与展示，但不进入指数合成。
+换手率与成交额也照常采集与展示（换手率另用于恐慌抛售得分），同样不参与指数合成。
 """
 
 from __future__ import annotations
 
-from .config import ComponentSpec, ScaleSpec
+from .config import ComponentSpec, ScaleSpec, fixed_window_component
 
 # 输出列命名规则：
 #   direct  : 每个尺度一列 {name}_pct_{window}；多尺度时另有混合列 {name}_pct
@@ -27,8 +33,27 @@ def count_column(name: str, sign: str) -> str:
     return f'{value_column(name, sign)}_n'
 
 
+def score_column(name: str, sign: str = 'direct') -> str:
+    """阈值映射分量的取值列（`level_map` 分量不使用分位，因此不叫 `_pct`）。"""
+    return f'{name}_score' if sign == 'direct' else f'{name}_reverse_score'
+
+
+def score_count_column(name: str, sign: str = 'direct') -> str:
+    return f'{score_column(name, sign)}_n'
+
+
+def price_ma_column(window: int) -> str:
+    """价格位置用的均线列名（窗口可配，与 `sentiment_pct_{window}` 同一命名风格）。"""
+    return f'price_ma_{int(window)}'
+
+
 def emitted_columns(component: ComponentSpec) -> tuple[str, ...]:
     """该分量实际输出的列（顺序固定）。"""
+    if component.transform == 'level_map':
+        return (
+            score_column(component.name, component.sign),
+            score_count_column(component.name, component.sign),
+        )
     multi = len(component.scales) > 1
     columns: list[str] = []
     if component.sign == 'direct':
@@ -50,6 +75,20 @@ def primary_scale(component: ComponentSpec) -> ScaleSpec:
     return max(component.scales, key=lambda s: (s.weight, s.window))
 
 
+def value_series_column(component: ComponentSpec) -> str:
+    """该分量进入指数合成时使用的取值列（与 `FeatureBundle.values` 同一序列）。
+
+    - `level_map`：阈值映射列；
+    - 反向或多尺度：混合列；
+    - 单尺度 direct：主尺度列。
+    """
+    if component.transform == 'level_map':
+        return score_column(component.name, component.sign)
+    if component.sign == 'reverse' or len(component.scales) > 1:
+        return value_column(component.name, component.sign)
+    return scale_column(component.name, component.sign, primary_scale(component).window)
+
+
 def _spec(
     name: str,
     source: str,
@@ -59,6 +98,9 @@ def _spec(
     sign: str = 'direct',
     availability_lag: int = 0,
     horizon: str = 'mid',
+    transform: str = 'percentile',
+    level_map: tuple[tuple[float, float], ...] = (),
+    in_index: bool = True,
 ) -> ComponentSpec:
     return ComponentSpec(
         name=name,
@@ -68,17 +110,59 @@ def _spec(
         scales=scales,
         availability_lag=availability_lag,
         horizon=horizon,  # type: ignore[arg-type]
+        transform=transform,  # type: ignore[arg-type]
+        level_map=level_map,
+        in_index=in_index,
     )
 
 
 _W252 = (ScaleSpec(252),)
 
-# --- 默认画像（规格书口径：全部 252 日单尺度） --------------------------------
+# --- 参与度指数：固定口径，不随窗口旋钮变化 ------------------------------------
+
+# 量比阈值映射锚点：量比 0.5 -> 0 分、1.0 -> 50 分、2.0 -> 100 分，中间分段线性，
+# 两端截断。取值只由锚点决定：不取分位、不看历史样本。
+VOLUME_RATIO_LEVEL_ANCHORS: tuple[tuple[float, float], ...] = (
+    (0.5, 0.0),
+    (1.0, 50.0),
+    (2.0, 100.0),
+)
+# 量比自带的 20 日均量窗口与两融交易额的分位窗口（交易日，约 1 个月）
+VOLUME_MA_WINDOW: int = 20
+MARGIN_TURNOVER_WINDOW: int = 20
+
+# 参与度指数 = 0.5 × 量比得分 + 0.5 × 两融交易额 20 日分位（等权）。
+# 只放无符号量：净买入（有符号）与方向指数同源，放进来会让两条轴不正交。
+#
+# `margin_turnover` 显式不使用 `availability_lag`（取值 0）：两融 T 日盘后不公布，
+# 用 shift(1) 拿 T-1 的观测会把昨天的活跃度记到今天头上，读数与"数据日期"不符。
+# 改为当日缺了就算缺——`compose_index` 按可用分量重归一，覆盖率 0.5 恰好通过
+# `min_index_coverage`，于是当日两融未发布时参与度 = 量比得分（权重 100%）。
+# 代价是最新交易日的读数会在两融发布后被重算（当日为量比口径，次日转为等权口径）。
+PARTICIPATION_INDEX_COMPONENTS: tuple[ComponentSpec, ...] = (
+    _spec(
+        'volume_ratio',
+        'volume_ratio',
+        'participation',
+        (ScaleSpec(VOLUME_MA_WINDOW, min_periods=VOLUME_MA_WINDOW),),
+        transform='level_map',
+        level_map=VOLUME_RATIO_LEVEL_ANCHORS,
+    ),
+    _spec(
+        'margin_turnover',
+        'margin_turnover',
+        'participation',
+        (ScaleSpec(MARGIN_TURNOVER_WINDOW),),
+        availability_lag=0,
+    ),
+)
+
+# --- 默认画像（规格书口径：方向分量 252 日单尺度） -----------------------------
 DEFAULT_COMPONENTS: tuple[ComponentSpec, ...] = (
-    _spec('turnover', 'turnover_rate', 'participation', _W252),
-    _spec('amount', 'amount', 'participation', _W252),
-    _spec('volume_ratio', 'volume_ratio', 'participation', _W252),
-    _spec('margin_net_buy', 'margin_net_buy', 'participation', _W252, availability_lag=1),
+    # 换手率仍用于恐慌抛售得分（换手率分位）与页面展示，但不参与指数合成。
+    _spec('turnover', 'turnover_rate', 'participation', _W252, in_index=False),
+    _spec('amount', 'amount', 'participation', _W252, in_index=False),
+    *PARTICIPATION_INDEX_COMPONENTS,
     _spec('return_20d', 'return', 'direction', _W252),
     _spec('macd_hist_norm', 'macd_hist_norm', 'direction', _W252),
     _spec('limit_up_down_ratio', 'limit_up_down_ratio', 'direction', _W252),
@@ -100,11 +184,9 @@ _W21 = (ScaleSpec(21),)
 _W63 = (ScaleSpec(63),)
 
 PROFILE_FAST: tuple[ComponentSpec, ...] = (
-    _spec('turnover', 'turnover_rate', 'participation', _W21, horizon='short'),
-    _spec('amount', 'amount', 'participation', _W21, horizon='short'),
-    _spec('volume_ratio', 'volume_ratio', 'participation', _W21, horizon='short'),
-    _spec('margin_net_buy', 'margin_net_buy', 'participation', _W21, horizon='short',
-          availability_lag=1),
+    _spec('turnover', 'turnover_rate', 'participation', _W21, horizon='short', in_index=False),
+    _spec('amount', 'amount', 'participation', _W21, horizon='short', in_index=False),
+    *PARTICIPATION_INDEX_COMPONENTS,
     _spec('return_20d', 'return', 'direction', _W21, horizon='short'),
     _spec('macd_hist_norm', 'macd_hist_norm', 'direction', _W21, horizon='short'),
     _spec('limit_up_down_ratio', 'limit_up_down_ratio', 'direction', _W21, horizon='short'),
@@ -114,11 +196,9 @@ PROFILE_FAST: tuple[ComponentSpec, ...] = (
 )
 
 PROFILE_FAST_MIXED: tuple[ComponentSpec, ...] = (
-    _spec('turnover', 'turnover_rate', 'participation', _W21, horizon='short'),
-    _spec('amount', 'amount', 'participation', _W21, horizon='short'),
-    _spec('volume_ratio', 'volume_ratio', 'participation', _W63, horizon='short'),
-    _spec('margin_net_buy', 'margin_net_buy', 'participation', _W21, horizon='short',
-          availability_lag=1),
+    _spec('turnover', 'turnover_rate', 'participation', _W21, horizon='short', in_index=False),
+    _spec('amount', 'amount', 'participation', _W21, horizon='short', in_index=False),
+    *PARTICIPATION_INDEX_COMPONENTS,
     _spec('return_20d', 'return', 'direction', _W63, horizon='short'),
     _spec('macd_hist_norm', 'macd_hist_norm', 'direction', _W63, horizon='short'),
     _spec('limit_up_down_ratio', 'limit_up_down_ratio', 'direction', _W21, horizon='short'),
@@ -132,10 +212,19 @@ def with_percentile_window(
     components: tuple[ComponentSpec, ...],
     window: int,
 ) -> tuple[ComponentSpec, ...]:
-    """把每个分量的尺度统一替换成单一窗口（做窗口敏感性实验用）。"""
+    """把分量的尺度统一替换成单一窗口（做窗口敏感性实验用）。
+
+    参与度指数的两个分量是固定口径（量比阈值映射、两融交易额 20 日分位），
+    因此跳过 `fixed_window_component`，窗口旋钮只作用于方向指数与不参与指数的输入。
+    """
     from dataclasses import replace
 
-    return tuple(replace(component, scales=(ScaleSpec(window),)) for component in components)
+    return tuple(
+        component
+        if fixed_window_component(component)
+        else replace(component, scales=(ScaleSpec(window),))
+        for component in components
+    )
 
 
 def config_for_profile(
@@ -176,9 +265,10 @@ WINDOW_PRESETS: dict[str, int] = {
     '1年': 252,
 }
 
-# 与分量自带平滑期（20 日量比 / 20 日收益 / EMA12-26-9）相称的最短窗口
+# 与分量自带平滑期（20 日收益 / EMA12-26-9）相称的最短窗口。
+# 量比不再取分位（改为阈值映射），因此不在这个名单里。
 _SMOOTHED_MIN_WINDOW = 63
-_SMOOTHED_COMPONENTS = ('volume_ratio', 'return_20d', 'macd_hist_norm')
+_SMOOTHED_COMPONENTS = ('return_20d', 'macd_hist_norm')
 
 
 def resolve_window(window: int | str) -> int:
@@ -224,9 +314,17 @@ def config_for_window(
         components = base
     elif profile == 'mixed':
         components = tuple(
-            replace(
+            component
+            if fixed_window_component(component)
+            else replace(
                 component,
-                scales=(ScaleSpec(size if component.name not in _SMOOTHED_COMPONENTS else max(size, _SMOOTHED_MIN_WINDOW)),),
+                scales=(
+                    ScaleSpec(
+                        size
+                        if component.name not in _SMOOTHED_COMPONENTS
+                        else max(size, _SMOOTHED_MIN_WINDOW)
+                    ),
+                ),
             )
             for component in base
         )
@@ -257,12 +355,10 @@ def default_config():
 
 PROFILE_MULTISCALE_SUGGESTED: tuple[ComponentSpec, ...] = (
     _spec('turnover', 'turnover_rate', 'participation',
-          (ScaleSpec(63, 0.4), ScaleSpec(252, 0.6)), horizon='mixed'),
+          (ScaleSpec(63, 0.4), ScaleSpec(252, 0.6)), horizon='mixed', in_index=False),
     _spec('amount', 'amount', 'participation',
-          (ScaleSpec(63, 0.4), ScaleSpec(252, 0.6)), horizon='mixed'),
-    _spec('volume_ratio', 'volume_ratio', 'participation',
-          (ScaleSpec(63, 0.5), ScaleSpec(252, 0.5)), horizon='mixed'),
-    _spec('margin_net_buy', 'margin_net_buy', 'participation', _W252, availability_lag=1),
+          (ScaleSpec(63, 0.4), ScaleSpec(252, 0.6)), horizon='mixed', in_index=False),
+    *PARTICIPATION_INDEX_COMPONENTS,
     _spec('return_20d', 'return', 'direction',
           (ScaleSpec(63, 0.4), ScaleSpec(252, 0.6)), horizon='mixed'),
     _spec('macd_hist_norm', 'macd_hist_norm', 'direction',
@@ -279,8 +375,8 @@ PROFILE_MULTISCALE_SUGGESTED: tuple[ComponentSpec, ...] = (
 SPEC_REQUIRED_COMPONENT_COLUMNS: tuple[str, ...] = (
     'turnover_pct_252',
     'amount_pct_252',
-    'volume_ratio_pct_252',
-    'margin_net_buy_pct_252',
+    'volume_ratio_score',
+    'margin_turnover_pct_20',
     'return_20d_pct_252',
     'macd_hist_norm_pct_252',
     'limit_up_down_ratio_pct_252',

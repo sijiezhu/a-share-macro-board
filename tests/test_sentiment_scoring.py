@@ -24,6 +24,11 @@ def series(values, index=None):
     return pd.Series([float(v) for v in values], index=index)
 
 
+def code_series(values, index=None):
+    """码值序列（状态 / 位置），不做数值转换。"""
+    return pd.Series(list(values), index=index, dtype='object')
+
+
 class StateTests(unittest.TestCase):
     def test_state_codes_follow_thresholds(self):
         participation = series([60, 40, 60.1, 60.1, 39.9, 39.9, 70])
@@ -69,6 +74,103 @@ class StateTests(unittest.TestCase):
             list(band),
             [codes.BAND_HIGH, codes.BAND_MID, codes.BAND_LOW, codes.BAND_UNAVAILABLE],
         )
+
+
+class PositionTests(unittest.TestCase):
+    """价格位置：收盘 vs 均线（严格不等式，恰好相等按低位）。"""
+
+    def test_position_codes_follow_the_average(self):
+        close = series([101, 99, 100, math.nan, 100, 100])
+        average = series([100, 100, 100, 100, math.nan, 0])
+        position = scoring.classify_position(close, average)
+        self.assertEqual(
+            list(position),
+            [
+                codes.POS_HIGH,  # 101 > 100
+                codes.POS_LOW,  # 99 < 100
+                codes.POS_LOW,  # 恰好等于均线 -> 低位，不声称"高于"
+                codes.POS_UNKNOWN,  # 当日无收盘
+                codes.POS_UNKNOWN,  # 无均线
+                codes.POS_UNKNOWN,  # 均线非法（<= 0）
+            ],
+        )
+
+    def test_position_is_never_nan(self):
+        position = scoring.classify_position(series([math.nan]), series([math.nan]))
+        self.assertTrue(position.notna().all())
+        self.assertEqual(position.iloc[0], codes.POS_UNKNOWN)
+
+    def test_classify_state_without_position_keeps_base_codes(self):
+        """不传 position 时，结果与加入位置维度之前逐行一致（兼容路径）。"""
+        participation = series([70, 70, 30, 30, 50])
+        direction = series([70, 30, 30, 70, 50])
+        with_none = scoring.classify_state(participation, direction, SentimentThresholds())
+        with_unknown = scoring.classify_state(
+            participation,
+            direction,
+            SentimentThresholds(),
+            position=code_series([codes.POS_UNKNOWN] * 5),
+        )
+        self.assertEqual(
+            list(with_none),
+            [
+                codes.STATE_GREED,
+                codes.STATE_PANIC,
+                codes.STATE_COLD,
+                codes.STATE_THAW,
+                codes.STATE_NEUTRAL,
+            ],
+        )
+        self.assertEqual(list(with_none), list(with_unknown))
+
+    def test_classify_state_splits_every_quadrant_by_position(self):
+        participation = series([70, 70, 70, 70, 30, 30, 30, 30])
+        direction = series([70, 70, 30, 30, 30, 30, 70, 70])
+        position = code_series(
+            [codes.POS_HIGH, codes.POS_LOW] * 4
+        )
+        state = scoring.classify_state(participation, direction, SentimentThresholds(), position=position)
+        self.assertEqual(
+            list(state),
+            [
+                codes.STATE_GREED_HIGH,
+                codes.STATE_GREED_LOW,
+                codes.STATE_PANIC_HIGH,
+                codes.STATE_PANIC_LOW,
+                codes.STATE_COLD_HIGH,
+                codes.STATE_COLD_LOW,
+                codes.STATE_THAW_HIGH,
+                codes.STATE_THAW_LOW,
+            ],
+        )
+
+    def test_neutral_and_unavailable_are_not_split(self):
+        state = scoring.classify_state(
+            series([50, math.nan]),
+            series([50, 50]),
+            SentimentThresholds(),
+            position=code_series([codes.POS_HIGH, codes.POS_HIGH]),
+        )
+        self.assertEqual(list(state), [codes.STATE_NEUTRAL, codes.STATE_UNAVAILABLE])
+
+    def test_every_base_state_and_position_has_a_combination(self):
+        for base, position, combined in scoring.STATE_COMBINATIONS:
+            with self.subTest(base=base, position=position):
+                self.assertIn(base, codes.STATE_CODES)
+                self.assertIn(position, codes.POSITION_CODES)
+                self.assertIn(combined, codes.STATE_CODES)
+                self.assertIn(combined, labels.STATE_LABELS)
+        self.assertEqual(len(scoring.STATE_COMBINATIONS), 8)
+
+    def test_position_outside_the_index_is_unknown(self):
+        """position 索引与状态不一致时（对齐问题）按位置未知处理，不丢行。"""
+        state = scoring.classify_state(
+            series([70]),
+            series([70]),
+            SentimentThresholds(),
+            position=pd.Series([codes.POS_HIGH], index=[99]),
+        )
+        self.assertEqual(state.iloc[0], codes.STATE_GREED)
 
 
 class ComposeIndexTests(unittest.TestCase):
@@ -437,7 +539,7 @@ class EndToEndTests(unittest.TestCase):
                 'volume': volume,
                 'amount': [v * c for v, c in zip(volume, close, strict=True)],
                 'turnover_rate': turnover,
-                'margin_net_buy': [-1e8] * rally + [-6e8] * 60,
+                'margin_turnover': [2e8] * rally + [6e8] * 60,
                 'up_count': up,
                 'down_count': down,
                 'limit_up_count': [20.0] * rally + [3.0] * 60,
@@ -508,10 +610,11 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn(code, labels.MACD_VOL_STATE_LABELS)
 
     def test_nested_warmup_boundaries(self):
-        """min_periods=120：分量分位第 121 行起有值，嵌套的综合分位第 241 行起有值。"""
+        """参与度指数第 11 行起有值（两融交易额 20 日分位），嵌套的综合分位第 241 行起有值。"""
         frame = compute_sentiment(self._crash_frame(560))
-        self.assertEqual(int(frame['participation_index'].first_valid_index()), 120)
-        self.assertEqual(int(frame['volume_ratio_pct_252'].first_valid_index()), 139)
+        self.assertEqual(int(frame['participation_index'].first_valid_index()), 10)
+        self.assertEqual(int(frame['volume_ratio_score'].first_valid_index()), 19)
+        self.assertEqual(int(frame['margin_turnover_pct_20'].first_valid_index()), 10)
         self.assertTrue(math.isnan(float(frame['sentiment_pct_252'].iloc[239])))
         self.assertFalse(math.isnan(float(frame['sentiment_pct_252'].iloc[240])))
 
@@ -519,12 +622,33 @@ class EndToEndTests(unittest.TestCase):
         """样本刚够时先出指数、但覆盖率与缺失分量必须可见（不假装指标齐全）。"""
         frame = normalize_frame(self._crash_frame(560)).frame
         scored = scoring.score_all(frame).frame
-        self.assertAlmostEqual(float(scored['participation_coverage'].iloc[120]), 0.5, places=12)
-        self.assertIn('volume_ratio', scored['participation_missing'].iloc[120])
-        self.assertAlmostEqual(float(scored['participation_coverage'].iloc[139]), 1.0, places=12)
+        self.assertAlmostEqual(float(scored['participation_coverage'].iloc[11]), 0.5, places=12)
+        self.assertIn('volume_ratio', scored['participation_missing'].iloc[11])
+        self.assertAlmostEqual(float(scored['participation_coverage'].iloc[19]), 1.0, places=12)
+        self.assertEqual(scored['participation_missing'].iloc[19], ())
+
+    def test_margin_unpublished_falls_back_to_volume_ratio(self):
+        """两融当日未发布时不取前一日的值顶替：参与度 = 量比得分（权重 100%）。
+
+        回归：曾用 availability_lag=1 把前一日的两融当成当日值，
+        页面上标注「数据日期 = 当日」的读数里混着昨天的活跃度。
+        """
+        raw = self._crash_frame(560)
+        raw.iloc[-1, raw.columns.get_loc('margin_turnover')] = float('nan')
+        frame = compute_sentiment(raw)
+        last = frame.iloc[-1]
+        self.assertTrue(math.isnan(float(last['margin_turnover_pct_20'])))
+        self.assertAlmostEqual(float(last['participation_coverage']), 0.5, places=12)
+        self.assertIn('margin_turnover', last['participation_missing'])
+        # 权重全部落在量比得分上，而不是拿前一日两融补位
+        self.assertAlmostEqual(
+            float(last['participation_index']), float(last['volume_ratio_score']), places=9
+        )
+        # 只是"当日缺"：前一日仍是满覆盖，说明没有整列退化
+        self.assertAlmostEqual(float(frame['participation_coverage'].iloc[-2]), 1.0, places=12)
 
     def test_missing_optional_columns_still_scores(self):
-        raw = self._crash_frame().drop(columns=['pcr', 'implied_volatility', 'margin_net_buy'])
+        raw = self._crash_frame().drop(columns=['pcr', 'implied_volatility', 'margin_turnover'])
         frame = normalize_frame(raw).frame
         scored = scoring.score_all(frame).frame
         self.assertFalse(math.isnan(float(scored['direction_index'].iloc[-1])))

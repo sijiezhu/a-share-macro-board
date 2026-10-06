@@ -15,6 +15,36 @@ STATE_THAW = 'STATE_THAW'
 STATE_NEUTRAL = 'STATE_NEUTRAL'
 STATE_UNAVAILABLE = 'STATE_UNAVAILABLE'
 
+# --- price position (close vs its own moving average) --------------------------
+# Unrelated to BAND_HIGH / BAND_LOW: BAND_* bands the index values themselves,
+# POS_* describes where the price sits relative to its own moving average.
+POS_HIGH = 'POS_HIGH'
+POS_LOW = 'POS_LOW'
+POS_UNKNOWN = 'POS_UNKNOWN'
+
+POSITION_CODES: tuple[str, ...] = (POS_HIGH, POS_LOW, POS_UNKNOWN)
+
+# Quadrant x price position; unknown position falls back to the base quadrant codes.
+STATE_GREED_HIGH = 'STATE_GREED_HIGH'
+STATE_GREED_LOW = 'STATE_GREED_LOW'
+STATE_PANIC_HIGH = 'STATE_PANIC_HIGH'
+STATE_PANIC_LOW = 'STATE_PANIC_LOW'
+STATE_COLD_HIGH = 'STATE_COLD_HIGH'
+STATE_COLD_LOW = 'STATE_COLD_LOW'
+STATE_THAW_HIGH = 'STATE_THAW_HIGH'
+STATE_THAW_LOW = 'STATE_THAW_LOW'
+
+COMPOSITE_STATE_CODES: tuple[str, ...] = (
+    STATE_GREED_HIGH,
+    STATE_GREED_LOW,
+    STATE_PANIC_HIGH,
+    STATE_PANIC_LOW,
+    STATE_COLD_HIGH,
+    STATE_COLD_LOW,
+    STATE_THAW_HIGH,
+    STATE_THAW_LOW,
+)
+
 STATE_CODES: tuple[str, ...] = (
     STATE_GREED,
     STATE_PANIC,
@@ -22,7 +52,7 @@ STATE_CODES: tuple[str, ...] = (
     STATE_THAW,
     STATE_NEUTRAL,
     STATE_UNAVAILABLE,
-)
+) + COMPOSITE_STATE_CODES
 
 # --- index bands (for a true 2x2 grid) ----------------------------------------
 BAND_HIGH = 'BAND_HIGH'

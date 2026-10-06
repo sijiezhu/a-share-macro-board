@@ -22,6 +22,7 @@ API_URL = 'https://mkapi2.dfcfs.com/finskillshub/api/claw/query'
 # 因此年度回补固定使用自然年，落地后再按目标区间过滤。
 QUERY_HS300_PE_YEAR = '沪深300指数市盈率PE-TTM {year}年1月1日至{year}年12月31日每个交易日'
 QUERY_HS300_CLOSE_YEAR = '沪深300指数收盘价 {year}年1月1日至{year}年12月31日每个交易日'
+QUERY_SH_CLOSE_YEAR = '上证指数收盘价 {year}年1月1日至{year}年12月31日每个交易日'
 QUERY_ADV_YEAR = '沪深A股上涨家数 {year}年1月1日至{year}年12月31日每个交易日'
 QUERY_DEC_YEAR = '沪深A股下跌家数 {year}年1月1日至{year}年12月31日每个交易日'
 QUERY_FLAT_YEAR = '沪深A股平盘家数 {year}年1月1日至{year}年12月31日每个交易日'
@@ -181,6 +182,13 @@ def fetch_hs300_close(
     return fetch_year_series(session, api_key, QUERY_HS300_CLOSE_YEAR, start, end)
 
 
+def fetch_sh_close(
+    session: requests.Session, api_key: str, start: date, end: date
+) -> FetchedSeries:
+    """按自然年分段抓取上证指数收盘价。"""
+    return fetch_year_series(session, api_key, QUERY_SH_CLOSE_YEAR, start, end)
+
+
 def fetch_year_series(
     session: requests.Session,
     api_key: str,
@@ -231,24 +239,76 @@ def parse_pe_value(raw: object) -> float | None:
     return value
 
 
-def build_margin_net_buy(
+def same_date_margin_pairs(
     buy_rows: Sequence[tuple[date, float]],
     repay_rows: Sequence[tuple[date, float]],
-) -> list[tuple[date, float]]:
-    """融资净买入 = 同日融资买入额 − 同日融资偿还额。
+) -> list[tuple[date, float, float]]:
+    """两融双侧按同一数据日期配对：`(日期, 融资买入额, 融资偿还额)`，日期升序。
 
     只保留两侧都有观测的日期：不做前向填充、不做插值（与股债利差同口径），
     因此缺单侧的交易日会被整条丢弃，而不是用另一侧顶替。
     """
     repay = {day: float(value) for day, value in repay_rows}
-    out: list[tuple[date, float]] = []
+    pairs: list[tuple[date, float, float]] = []
     for day, buy in buy_rows:
         other = repay.get(day)
         if other is None:
             continue
-        out.append((day, float(buy) - other))
-    out.sort(key=lambda item: item[0])
-    return out
+        pairs.append((day, float(buy), other))
+    pairs.sort(key=lambda item: item[0])
+    return pairs
+
+
+def build_margin_net_buy(
+    buy_rows: Sequence[tuple[date, float]],
+    repay_rows: Sequence[tuple[date, float]],
+) -> list[tuple[date, float]]:
+    """融资净买入 = 同日融资买入额 − 同日融资偿还额（有符号，可为负）。"""
+    return [(day, buy - repay) for day, buy, repay in same_date_margin_pairs(buy_rows, repay_rows)]
+
+
+def build_margin_turnover(
+    buy_rows: Sequence[tuple[date, float]],
+    repay_rows: Sequence[tuple[date, float]],
+) -> list[tuple[date, float]]:
+    """两融交易额 = 同日融资买入额 + 同日融资偿还额（无符号，恒 >= 0）。
+
+    与净买入共用同一份双侧观测，因此两者数据日期完全一致，也不额外增加接口调用：
+    净买入表达"往哪个方向加杠杆"，交易额表达"加杠杆有多活跃"（参与度用后者）。
+    """
+    return [(day, buy + repay) for day, buy, repay in same_date_margin_pairs(buy_rows, repay_rows)]
+
+
+def fetch_margin_series(
+    session: requests.Session,
+    api_key: str,
+    start: date,
+    end: date,
+) -> dict[str, FetchedSeries]:
+    """两融双侧原始序列 → 净买入（有符号）与两融交易额（无符号）。
+
+    只查一次「融资买入额」与一次「融资偿还额」，两个派生指标共用这份观测，
+    所以新增指标不增加妙想调用次数，也不会出现两个指标日期集合不一致的情况。
+    """
+    buy = fetch_year_series(session, api_key, QUERY_MARGIN_BUY_YEAR, start, end)
+    repay = fetch_year_series(session, api_key, QUERY_MARGIN_REPAY_YEAR, start, end)
+    pairs = same_date_margin_pairs(buy.rows, repay.rows)
+    if not pairs:
+        raise SourceError('融资买入额与融资偿还额没有共同数据日期')
+    warnings = [*buy.warnings, *repay.warnings]
+    dropped = len(buy.rows) - len(pairs)
+    if dropped > 0:
+        warnings.append(f'{dropped} 个交易日只有单侧两融数据，已整条跳过（不做前向填充）')
+    return {
+        'margin_net_buy': FetchedSeries(
+            rows=[(day, buy_value - repay_value) for day, buy_value, repay_value in pairs],
+            warnings=list(warnings),
+        ),
+        'margin_turnover': FetchedSeries(
+            rows=[(day, buy_value + repay_value) for day, buy_value, repay_value in pairs],
+            warnings=list(warnings),
+        ),
+    }
 
 
 def fetch_margin_net_buy(
@@ -257,17 +317,8 @@ def fetch_margin_net_buy(
     start: date,
     end: date,
 ) -> FetchedSeries:
-    """两融净买入：分别抓融资买入额与融资偿还额后按同日相减。"""
-    buy = fetch_year_series(session, api_key, QUERY_MARGIN_BUY_YEAR, start, end)
-    repay = fetch_year_series(session, api_key, QUERY_MARGIN_REPAY_YEAR, start, end)
-    rows = build_margin_net_buy(buy.rows, repay.rows)
-    warnings = [*buy.warnings, *repay.warnings]
-    if not rows:
-        raise SourceError('融资买入额与融资偿还额没有共同数据日期')
-    dropped = len(buy.rows) - len(rows)
-    if dropped > 0:
-        warnings.append(f'{dropped} 个交易日只有单侧两融数据，已整条跳过（不做前向填充）')
-    return FetchedSeries(rows=rows, warnings=warnings)
+    """兼容入口：只取净买入序列（内部仍只发两次查询）。"""
+    return fetch_margin_series(session, api_key, start, end)['margin_net_buy']
 
 
 def fetch_a_share_activity(
@@ -276,7 +327,7 @@ def fetch_a_share_activity(
     start: date,
     end: date,
 ) -> dict[str, FetchedSeries]:
-    """A股情绪算法的原始输入：成交额/成交量/换手率/涨跌停家数/融资净买入。
+    """A股情绪算法的原始输入：成交额/成交量/换手率/涨跌停家数/两融（净买入 + 交易额）。
 
     单个指标失败只影响它自己（返回空序列并带告警，编排层据此标为 missing），
     全部指标都失败才抛 SourceError。
@@ -295,9 +346,10 @@ def fetch_a_share_activity(
         except SourceError as exc:
             out[metric] = FetchedSeries(rows=[], warnings=[f'{metric} 抓取失败：{exc}'])
     try:
-        out['margin_net_buy'] = fetch_margin_net_buy(session, api_key, start, end)
+        out.update(fetch_margin_series(session, api_key, start, end))
     except SourceError as exc:
-        out['margin_net_buy'] = FetchedSeries(rows=[], warnings=[f'margin_net_buy 抓取失败：{exc}'])
+        for metric in ('margin_net_buy', 'margin_turnover'):
+            out[metric] = FetchedSeries(rows=[], warnings=[f'{metric} 抓取失败：{exc}'])
     if not any(item.rows for item in out.values()):
         details = '; '.join(warning for item in out.values() for warning in item.warnings)
         raise SourceError(f'A股情绪输入全部失败：{details}')

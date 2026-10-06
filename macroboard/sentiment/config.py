@@ -14,16 +14,22 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as dataclass_fields
+from itertools import pairwise
 from typing import Any, Literal
 
 PercentileMethod = Literal['midrank_exclusive', 'rank_inclusive']
 ComponentGroup = Literal['participation', 'direction']
 ComponentSign = Literal['direct', 'reverse']
 Horizon = Literal['short', 'mid', 'long', 'mixed']
+# 分量的取值方式：
+#   'percentile'：先算滚动分位，再（可选）反向；
+#   'level_map'：把输入值按锚点分段线性映射到 0—100（阈值映射），不做分位。
+TransformKind = Literal['percentile', 'level_map']
 
 PERCENTILE_METHODS: tuple[str, ...] = ('midrank_exclusive', 'rank_inclusive')
 COMPONENT_GROUPS: tuple[str, ...] = ('participation', 'direction')
 COMPONENT_SIGNS: tuple[str, ...] = ('direct', 'reverse')
+TRANSFORM_KINDS: tuple[str, ...] = ('percentile', 'level_map')
 PRICE_GAP_POLICIES: tuple[str, ...] = ('ffill_state', 'nan_propagate')
 ZERO_VOLUME_POLICIES: tuple[str, ...] = ('nan', 'keep')
 MISSING_POLICIES: tuple[str, ...] = ('nan', 'ffill')
@@ -55,7 +61,12 @@ class ScaleSpec:
 
 @dataclass(frozen=True, slots=True)
 class ComponentSpec:
-    """一个情绪分量：来源、归属维度、方向、尺度与可得性滞后。"""
+    """一个情绪分量：来源、归属维度、方向、尺度与可得性滞后。
+
+    `transform='level_map'` 时用 `level_map` 的锚点把输入值分段线性映射到 0—100
+    （阈值映射），此时 `scales` 只用于「有效样本计数 / 数据充分度」，不参与取值；
+    `in_index=False` 表示该分量照常计算与展示，但不进入指数合成（例如换手率、成交额）。
+    """
 
     name: str
     source: str
@@ -65,6 +76,14 @@ class ComponentSpec:
     weight: float = 1.0
     availability_lag: int = 0
     horizon: Horizon | None = None
+    transform: TransformKind = 'percentile'
+    level_map: tuple[tuple[float, float], ...] = ()
+    in_index: bool = True
+
+
+def fixed_window_component(component: ComponentSpec) -> bool:
+    """参与度指数的分量固定口径，不随窗口旋钮（`config_for_window`）变化。"""
+    return component.group == 'participation' and component.in_index
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +93,7 @@ class SentimentWindows:
     macd_slow: int = 26
     macd_signal: int = 9
     volume_ma: int = 20
+    price_ma_window: int = 60
     min_periods_ratio: float = MIN_PERIODS_RATIO
     return_horizons: tuple[int, ...] = (20,)
     sentiment_percentile_scales: tuple[ScaleSpec, ...] = (ScaleSpec(DEFAULT_PERCENTILE_WINDOW),)
@@ -116,6 +136,12 @@ class SentimentQuality:
     missing_policy: str = 'nan'
     ffill_limit: int = 0
     ffill_whitelist: tuple[str, ...] = ()
+    # 两融完整性校验（纯函数、只用历史，见 `inputs._exclude_incomplete_margin`）：
+    # 当日「两融交易额 ÷ 成交额」与前 window 个交易日（严格早于当日）该比值的中位数之比、
+    # 以及两融交易额与其自身历史中位数之比**同时**低于 threshold，判定源站当日只发布了
+    # 部分两融观测，该日两个两融字段一并按缺失处理。threshold = 0 表示关闭该校验。
+    margin_completeness_window: int = 20
+    margin_completeness_threshold: float = 0.7
     winsorize_enabled: bool = False
     winsorize_window: int = 252
     winsorize_lower_q: float = 0.01
@@ -219,6 +245,9 @@ def _component_to_dict(component: ComponentSpec) -> dict[str, object]:
         'weight': component.weight,
         'availability_lag': component.availability_lag,
         'horizon': component.horizon,
+        'transform': component.transform,
+        'level_map': [[float(x), float(y)] for x, y in component.level_map],
+        'in_index': component.in_index,
     }
 
 
@@ -229,6 +258,7 @@ def _windows_to_dict(windows: SentimentWindows) -> dict[str, object]:
         'macd_slow': windows.macd_slow,
         'macd_signal': windows.macd_signal,
         'volume_ma': windows.volume_ma,
+        'price_ma_window': windows.price_ma_window,
         'min_periods_ratio': windows.min_periods_ratio,
         'return_horizons': list(windows.return_horizons),
         'sentiment_percentile_scales': [_scale_to_dict(s) for s in windows.sentiment_percentile_scales],
@@ -267,7 +297,19 @@ def _component_from_raw(raw: object) -> ComponentSpec:
         return raw
     if not isinstance(raw, Mapping):
         raise ValueError(f'components 元素必须是 ComponentSpec 或映射，收到 {raw!r}')
-    allowed = {'name', 'source', 'group', 'sign', 'scales', 'weight', 'availability_lag', 'horizon'}
+    allowed = {
+        'name',
+        'source',
+        'group',
+        'sign',
+        'scales',
+        'weight',
+        'availability_lag',
+        'horizon',
+        'transform',
+        'level_map',
+        'in_index',
+    }
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f'components 含未知字段：{sorted(unknown)}')
@@ -290,7 +332,23 @@ def _component_from_raw(raw: object) -> ComponentSpec:
         weight=float(raw.get('weight', 1.0)),  # type: ignore[arg-type]
         availability_lag=int(raw.get('availability_lag', 0)),  # type: ignore[arg-type]
         horizon=None if raw.get('horizon') is None else str(raw['horizon']),  # type: ignore[arg-type]
+        transform=str(raw.get('transform', 'percentile')),  # type: ignore[arg-type]
+        level_map=_level_map_from_raw(raw.get('level_map')),
+        in_index=bool(raw.get('in_index', True)),
     )
+
+
+def _level_map_from_raw(raw: object) -> tuple[tuple[float, float], ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f'components.level_map 必须是锚点列表，收到 {raw!r}')
+    anchors: list[tuple[float, float]] = []
+    for item in raw:
+        if isinstance(item, str) or not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f'components.level_map 的锚点必须是 [输入值, 分值] 两元组，收到 {item!r}')
+        anchors.append((float(item[0]), float(item[1])))  # type: ignore[arg-type]
+    return tuple(anchors)
 
 
 def _thresholds_from_mapping(raw: Mapping[str, object]) -> SentimentThresholds:
@@ -321,6 +379,7 @@ def _windows_from_mapping(raw: Mapping[str, object]) -> SentimentWindows:
         'macd_slow',
         'macd_signal',
         'volume_ma',
+        'price_ma_window',
         'min_periods_ratio',
         'return_horizons',
         'sentiment_percentile_scales',
@@ -366,6 +425,8 @@ def _quality_from_mapping(raw: Mapping[str, object]) -> SentimentQuality:
         'winsorize_window',
         'winsorize_lower_q',
         'winsorize_upper_q',
+        'margin_completeness_window',
+        'margin_completeness_threshold',
         'dup_policy',
         'cross_latch_days',
         'divergence_require_negative_hist',
@@ -387,6 +448,10 @@ def _quality_from_mapping(raw: Mapping[str, object]) -> SentimentQuality:
         if isinstance(whitelist, str) or not isinstance(whitelist, (list, tuple)):
             raise ValueError('quality.ffill_whitelist 必须是列表')
         values['ffill_whitelist'] = tuple(str(item) for item in whitelist)
+    if 'margin_completeness_window' in values:
+        values['margin_completeness_window'] = int(values['margin_completeness_window'])  # type: ignore[arg-type]
+    if 'margin_completeness_threshold' in values:
+        values['margin_completeness_threshold'] = float(values['margin_completeness_threshold'])  # type: ignore[arg-type]
     return replace(SentimentQuality(), **values)  # type: ignore[arg-type]
 
 
@@ -435,6 +500,8 @@ def validate_config(config: SentimentConfig) -> None:
         raise ValueError(f'windows.macd_fast 必须小于 macd_slow（收到 {windows.macd_fast} / {windows.macd_slow}）')
     if windows.volume_ma < 2:
         raise ValueError(f'windows.volume_ma 必须 >= 2，收到 {windows.volume_ma}')
+    if windows.price_ma_window < 2:
+        raise ValueError(f'windows.price_ma_window 必须 >= 2，收到 {windows.price_ma_window}')
     if windows.divergence_lookback < 2:
         raise ValueError(f'windows.divergence_lookback 必须 >= 2，收到 {windows.divergence_lookback}')
     if windows.direction_rebound_lag < 1:
@@ -485,6 +552,15 @@ def validate_config(config: SentimentConfig) -> None:
         )
     if quality.winsorize_window < 2:
         raise ValueError(f'quality.winsorize_window 必须 >= 2，收到 {quality.winsorize_window}')
+    if quality.margin_completeness_window < 2:
+        raise ValueError(
+            f'quality.margin_completeness_window 必须 >= 2，收到 {quality.margin_completeness_window}'
+        )
+    if not 0 <= quality.margin_completeness_threshold <= 1:
+        raise ValueError(
+            'quality.margin_completeness_threshold 必须在 [0, 1]'
+            f'（0 表示关闭两融完整性校验），收到 {quality.margin_completeness_threshold}'
+        )
     if quality.ffill_limit < 0:
         raise ValueError(f'quality.ffill_limit 必须 >= 0，收到 {quality.ffill_limit}')
     if quality.warmup_bars < 0:
@@ -515,6 +591,14 @@ def validate_config(config: SentimentConfig) -> None:
             raise ValueError(
                 f'分量 {component.name!r} 的 group 必须是 {COMPONENT_GROUPS} 之一，收到 {component.group!r}'
             )
+        if component.transform not in TRANSFORM_KINDS:
+            raise ValueError(
+                f'分量 {component.name!r} 的 transform 必须是 {TRANSFORM_KINDS} 之一，'
+                f'收到 {component.transform!r}'
+            )
+        if not isinstance(component.in_index, bool):
+            raise ValueError(f'分量 {component.name!r} 的 in_index 必须是布尔值')
+        _validate_level_map(component)
         if component.sign not in COMPONENT_SIGNS:
             raise ValueError(
                 f'分量 {component.name!r} 的 sign 必须是 {COMPONENT_SIGNS} 之一，收到 {component.sign!r}'
@@ -524,7 +608,13 @@ def validate_config(config: SentimentConfig) -> None:
         if component.availability_lag < 0:
             raise ValueError(f'分量 {component.name!r} 的 availability_lag 必须 >= 0')
         if not component.scales:
-            raise ValueError(f'分量 {component.name!r} 的 scales 不能为空')
+            hint = (
+                '；level_map 分量也需要一个 ScaleSpec（只用于有效样本计数与数据充分度，'
+                '不参与取值）'
+                if component.transform == 'level_map'
+                else ''
+            )
+            raise ValueError(f'分量 {component.name!r} 的 scales 不能为空{hint}')
         windows_seen = [scale.window for scale in component.scales]
         if len(set(windows_seen)) != len(windows_seen):
             raise ValueError(f'分量 {component.name!r} 的 scales 窗口重复：{windows_seen}')
@@ -535,9 +625,38 @@ def validate_config(config: SentimentConfig) -> None:
         for scale in component.scales:
             _validate_scale(scale, windows.min_periods_ratio, quality.percentile_method, context=component.name)
     for group in COMPONENT_GROUPS:
-        group_weight = sum(c.weight for c in quality.components if c.group == group)
+        group_weight = sum(c.weight for c in quality.components if c.group == group and c.in_index)
         if group_weight <= 0:
-            raise ValueError(f'{group} 组的权重之和必须 > 0')
+            raise ValueError(f'{group} 组参与指数合成的权重之和必须 > 0')
+
+
+def _validate_level_map(component: ComponentSpec) -> None:
+    """校验阈值映射锚点：分段线性，输入值必须严格递增、分值在 0—100。"""
+    anchors = component.level_map
+    if component.transform == 'level_map':
+        if len(anchors) < 2:
+            raise ValueError(
+                f'分量 {component.name!r} 使用 level_map，必须给出至少 2 个锚点，收到 {len(anchors)}'
+            )
+    elif anchors:
+        raise ValueError(
+            f'分量 {component.name!r} 的 transform 是 percentile，不应配置 level_map 锚点'
+        )
+    for anchor in anchors:
+        if not isinstance(anchor, tuple) or len(anchor) != 2:
+            raise ValueError(
+                f'分量 {component.name!r} 的 level_map 锚点必须是 (输入值, 分值) 两元组，收到 {anchor!r}'
+            )
+    for x, y in anchors:
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError(f'分量 {component.name!r} 的 level_map 锚点必须是有限数值，收到 {x!r} / {y!r}')
+        if not 0.0 <= y <= 100.0:
+            raise ValueError(f'分量 {component.name!r} 的 level_map 分值必须在 0—100，收到 {y!r}')
+    for (previous, _), (current, _) in pairwise(anchors):
+        if current <= previous:
+            raise ValueError(
+                f'分量 {component.name!r} 的 level_map 输入阈值必须严格递增，收到 {anchors}'
+            )
 
 
 def _validate_scale(scale: ScaleSpec, ratio: float, default_method: str, *, context: str) -> None:

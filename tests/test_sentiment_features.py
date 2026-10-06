@@ -11,7 +11,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from macroboard.sentiment import features
+from macroboard.sentiment import features, registry
 from macroboard.sentiment.config import (
     ComponentSpec,
     ScaleSpec,
@@ -23,6 +23,8 @@ from macroboard.sentiment.registry import (
     DEFAULT_COMPONENTS,
     PROFILE_MULTISCALE_SUGGESTED,
     SPEC_REQUIRED_COMPONENT_COLUMNS,
+    VOLUME_RATIO_LEVEL_ANCHORS,
+    default_config,
     emitted_columns,
 )
 
@@ -40,6 +42,7 @@ def synthetic_frame(size: int = 320) -> pd.DataFrame:
             'amount': [v * c for v, c in zip(volume, close, strict=True)],
             'turnover_rate': [1.2 + 0.5 * math.sin(i / 11.0) for i in range(size)],
             'margin_net_buy': [2e8 * math.sin(i / 5.0) for i in range(size)],
+            'margin_turnover': [6e8 + 2e8 * math.sin(i / 5.0) for i in range(size)],
             'up_count': [1500.0 + 800.0 * math.sin(i / 9.0) for i in range(size)],
             'down_count': [1500.0 - 800.0 * math.sin(i / 9.0) for i in range(size)],
             'limit_up_count': [max(0.0, 30.0 * math.sin(i / 13.0)) for i in range(size)],
@@ -241,6 +244,69 @@ class MacdTests(unittest.TestCase):
             features.ema_features(pd.Series([1.0, 2.0]), fast=2, slow=3, signal=2, policy='magic')
 
 
+class PriceMaTests(unittest.TestCase):
+    """价格均线：用 `sh_close`、满窗口、不填充；缺口会让其后 window 行为 NaN。"""
+
+    @staticmethod
+    def _frame(size: int, sh_close: list[float] | None = None) -> pd.DataFrame:
+        columns = {'date': pd.bdate_range('2024-01-01', periods=size)}
+        if sh_close is not None:
+            columns['sh_close'] = sh_close
+        return pd.DataFrame(columns)
+
+    def test_price_ma_requires_the_full_window(self):
+        size = 65
+        frame = self._frame(size, sh_close=[float(3000 + i) for i in range(size)])
+        base = features.compute_base(frame, default_config())
+        column = registry.price_ma_column(60)
+        self.assertTrue(base[column].iloc[:59].isna().all())
+        expected = sum(float(3000 + i) for i in range(60)) / 60
+        self.assertAlmostEqual(base[column].iloc[59], expected, places=9)
+
+    def test_price_ma_uses_sh_close_not_close(self):
+        """位置口径走上证指数：`close`（沪深300）不得被拿来算这条均线。"""
+        size = 62
+        frame = self._frame(size, sh_close=[float(3000 + i) for i in range(size)])
+        frame['close'] = [float(4000 + 100 * i) for i in range(size)]
+        base = features.compute_base(frame, default_config())
+        expected = sum(float(3000 + i) for i in range(60)) / 60
+        self.assertAlmostEqual(base[registry.price_ma_column(60)].iloc[59], expected, places=9)
+
+    def test_gap_breaks_the_window_without_filling(self):
+        size = 125
+        values = [float(3000 + i) for i in range(size)]
+        values[70] = math.nan
+        frame = self._frame(size, sh_close=values)
+        base = features.compute_base(frame, default_config())
+        column = registry.price_ma_column(60)
+        # 缺口当日及其后 59 行都没有满窗口 -> 全 NaN（不做前向填充）
+        self.assertTrue(base[column].iloc[70:130].isna().all())
+        self.assertFalse(math.isnan(base[column].iloc[69]))
+
+    def test_missing_sh_close_column_is_nan(self):
+        frame = self._frame(65)
+        base = features.compute_base(frame, default_config())
+        column = registry.price_ma_column(60)
+        self.assertTrue(base[column].isna().all())
+        self.assertTrue(base['price_ma_gap'].isna().all())
+
+    def test_price_ma_gap_sign(self):
+        values = [float(3000)] * 59 + [4000.0, 4000.0]
+        base = features.compute_base(self._frame(61, sh_close=values), default_config())
+        gap = base['price_ma_gap'].iloc[60]
+        self.assertGreater(gap, 0.0)
+
+    def test_price_ma_window_is_configurable(self):
+        size = 25
+        frame = self._frame(size, sh_close=[float(3000 + i) for i in range(size)])
+        config = default_config()
+        config = config.replace(windows={'price_ma_window': 20})
+        base = features.compute_base(frame, config)
+        column = registry.price_ma_column(20)
+        self.assertIn(column, base.columns)
+        self.assertFalse(math.isnan(base[column].iloc[19]))
+
+
 class RatioAndVolumeTests(unittest.TestCase):
     def test_volume_ratio_requires_full_window(self):
         volume = pd.Series([float(100 + i) for i in range(25)])
@@ -273,6 +339,40 @@ class RatioAndVolumeTests(unittest.TestCase):
         self.assertTrue(math.isnan(out['down_ratio'].iloc[0]))
         self.assertAlmostEqual(out['up_ratio'].iloc[1], 0.25, places=12)
         self.assertAlmostEqual(out['limit_up_down_ratio'].iloc[1], 5.0, places=12)
+
+
+class LevelMapScoreTests(unittest.TestCase):
+    """量比等分量的阈值映射：分段线性、两端截断、缺失保持缺失。"""
+
+    ANCHORS = ((0.5, 0.0), (1.0, 50.0), (2.0, 100.0))
+
+    def test_piecewise_linear_between_anchors(self):
+        series = pd.Series([0.5, 0.75, 1.0, 1.5, 2.0])
+        score = features.level_map_score(series, self.ANCHORS)
+        for expected, actual in zip([0.0, 25.0, 50.0, 75.0, 100.0], score, strict=True):
+            self.assertAlmostEqual(float(actual), expected, places=12)
+
+    def test_out_of_range_values_are_clipped(self):
+        score = features.level_map_score(pd.Series([0.0, 0.49, 2.01, 10.0]), self.ANCHORS)
+        self.assertEqual(list(score), [0.0, 0.0, 100.0, 100.0])
+
+    def test_missing_values_stay_missing(self):
+        score = features.level_map_score(pd.Series([math.nan, 1.2, None]), self.ANCHORS)
+        self.assertTrue(math.isnan(float(score.iloc[0])))
+        self.assertAlmostEqual(float(score.iloc[1]), 60.0, places=12)
+        self.assertTrue(math.isnan(float(score.iloc[2])))
+
+    def test_mapping_does_not_depend_on_history(self):
+        """同一取值无论出现在序列开头还是结尾，映射结果相同（不看历史样本）。"""
+        short = features.level_map_score(pd.Series([1.3]), self.ANCHORS)
+        long = features.level_map_score(pd.Series([5.0, 0.1, 1.3]), self.ANCHORS)
+        self.assertAlmostEqual(float(short.iloc[0]), float(long.iloc[2]), places=12)
+
+    def test_invalid_anchors_raise(self):
+        with self.assertRaises(ValueError):
+            features.level_map_score(pd.Series([1.0]), ((1.0, 0.0),))
+        with self.assertRaises(ValueError):
+            features.level_map_score(pd.Series([1.0]), ((1.0, 0.0), (0.5, 100.0)))
 
 
 class BlendScaleTests(unittest.TestCase):
@@ -317,6 +417,19 @@ class BlendScaleTests(unittest.TestCase):
 
 
 class ComputeFeaturesTests(unittest.TestCase):
+    def test_volume_ratio_component_is_threshold_mapped_not_percentile(self):
+        frame = synthetic_frame(120)
+        bundle = features.compute_features(frame)
+        expected = features.level_map_score(
+            bundle.base['volume_ratio'], VOLUME_RATIO_LEVEL_ANCHORS
+        )
+        pd.testing.assert_series_equal(
+            bundle.percentiles['volume_ratio_score'], expected, check_names=False
+        )
+        # 量比自身需要 20 日均量，映射不引入额外窗口
+        self.assertTrue(bundle.percentiles['volume_ratio_score'].iloc[:19].isna().all())
+        self.assertFalse(bundle.percentiles['volume_ratio_score'].iloc[19:].isna().all())
+
     def test_default_columns_match_spec_required_names(self):
         frame = synthetic_frame(80)
         bundle = features.compute_features(frame)
@@ -428,12 +541,22 @@ class ComputeFeaturesTests(unittest.TestCase):
                     part.base[column], full.base[column].iloc[:150], check_names=False
                 )
 
-    def test_margin_net_buy_uses_availability_lag(self):
+    def test_margin_turnover_is_not_lagged(self):
+        """两融分位直接用当日观测（不做 shift(1)）：取 T-1 会把昨天的活跃度记到今天。
+
+        若这里改成与 `shift(1)` 的结果比对，就说明滞后被重新引入——正是要拦住的回归。
+        """
         frame = synthetic_frame(320)
         bundle = features.compute_features(frame)
-        lagged, _ = features.midrank_percentile(frame['margin_net_buy'].shift(1), 252, 120)
+        same_day, _ = features.midrank_percentile(frame['margin_turnover'], 20, 10)
         pd.testing.assert_series_equal(
-            bundle.percentiles['margin_net_buy_pct_252'], lagged, check_names=False
+            bundle.percentiles['margin_turnover_pct_20'], same_day, check_names=False
+        )
+        # 滞后与不滞后必须真的不同，否则这条测试无法区分两者
+        lagged, _ = features.midrank_percentile(frame['margin_turnover'].shift(1), 20, 10)
+        self.assertNotEqual(
+            bundle.percentiles['margin_turnover_pct_20'].dropna().to_numpy().tolist(),
+            lagged.dropna().to_numpy().tolist(),
         )
 
     def test_unknown_source_raises(self):
@@ -444,10 +567,10 @@ class ComputeFeaturesTests(unittest.TestCase):
 
     def test_missing_optional_columns_are_marked_not_fatal(self):
         frame = synthetic_frame(300).drop(
-            columns=['pcr', 'implied_volatility', 'margin_net_buy', 'limit_up_count', 'limit_down_count']
+            columns=['pcr', 'implied_volatility', 'margin_turnover', 'limit_up_count', 'limit_down_count']
         )
         bundle = features.compute_features(frame)
-        for column in ('pcr_reverse_pct', 'iv_reverse_pct', 'margin_net_buy_pct_252', 'limit_up_down_ratio_pct_252'):
+        for column in ('pcr_reverse_pct', 'iv_reverse_pct', 'margin_turnover_pct_20', 'limit_up_down_ratio_pct_252'):
             with self.subTest(column=column):
                 self.assertTrue(bundle.percentiles[column].isna().all())
         self.assertTrue(bundle.percentiles['turnover_pct_252'].notna().any())

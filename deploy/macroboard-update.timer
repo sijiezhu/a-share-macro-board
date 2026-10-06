@@ -1,10 +1,15 @@
 [Unit]
-Description=每天 08:30（Asia/Shanghai）采集 A股投资信息看板 数据
+Description=每天 15:01 与 20:30（Asia/Shanghai）采集 A股投资信息看板 数据
 Documentation=file:%h/Documents/macro_dashboard/docs/SCHEDULING.md
 
 [Timer]
 # 显式指定时区，避免宿主机时区不是北京时间时算错
-OnCalendar=*-*-* 08:30:00 Asia/Shanghai
+# 15:01：收盘后尽早取数，让当日读数尽快出现在页面上；
+# 20:30：补采一次。源站对部分序列（涨跌停家数等）发布晚于 15:01，
+# 只跑 15:01 时库里会留下一行"部分字段有值"的最新记录，指数读数要到次日才补齐。
+# 两次都跑同一个幂等采集作业，重复执行只是覆盖同一批观测。
+OnCalendar=*-*-* 15:01:00 Asia/Shanghai
+OnCalendar=*-*-* 20:30:00 Asia/Shanghai
 # 关机/休眠错过的当日采集在开机后补跑一次
 Persistent=true
 RandomizedDelaySec=60

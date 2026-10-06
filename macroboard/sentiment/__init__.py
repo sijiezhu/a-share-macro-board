@@ -36,9 +36,12 @@ from .features import (
     volume_ratio,
 )
 from .inputs import (
+    MARGIN_COMPLETENESS_COLUMNS,
     AvailabilityReport,
     ColumnStatus,
+    MarginCompletenessDrop,
     NormalizedInput,
+    margin_completeness_warning,
     normalize_frame,
     profile_columns,
 )
@@ -93,7 +96,9 @@ __all__ = [
     'DEFAULT_OUTPUT_COLUMNS',
     'FeatureBundle',
     'IndexResult',
+    'MARGIN_COMPLETENESS_COLUMNS',
     'MacdVolumeResult',
+    'MarginCompletenessDrop',
     'NormalizedInput',
     'PanicResult',
     'REQUIRED_COLUMNS',
@@ -123,6 +128,7 @@ __all__ = [
     'index_band',
     'labels',
     'macd_volume_metrics',
+    'margin_completeness_warning',
     'midrank_percentile',
     'normalize_frame',
     'output_columns',

@@ -7,7 +7,13 @@
 >   手动「立即采集一次」按钮已默认关闭（需 `MACROBOARD_ENABLE_MANUAL_REFRESH=1` 才出现）；
 >   启动日志会打印 `External URL`（Streamlit 探测到的公网 IP），
 >   请确认路由器没有做 8501 端口映射 / UPnP / DMZ，详见 `deploy/README.md`；
-> - `macroboard-update.timer`：enabled，下次触发 2026-09-20 08:30（Asia/Shanghai）；
+> - `macroboard-update.timer`：enabled，2026-09-23 起为每天 **15:01 与 20:30**（Asia/Shanghai）
+>   各触发一次（此前仅 15:01，更早为 08:30；改时间后需 `systemctl --user daemon-reload` 才生效）；
+>   - 15:01：收盘后尽早取数，让当日读数尽快出现在页面上；
+>   - 20:30：补采一次。源站对涨跌停家数等序列的发布晚于 15:01，只跑 15:01 时库里会先落下
+>     一行「部分字段有值」的最新记录，指数读数要到次日才补齐（2026-09-23 实测：15:01 采集
+>     报「成功 17/17」，但多数序列的最新日期仍停在上一交易日）；
+>   - 两次跑的是同一个幂等作业，重复执行只是覆盖同一批观测，不会写重复数据；
 > - `macroboard-update.service`：已由 timer 触发跑过一次，退出码 0，日志「成功 15/15」；
 > - `loginctl show-user` 的 `Linger=yes`，注销后用户级服务仍继续运行。
 >
@@ -20,19 +26,21 @@
 > 下面示例里的 `/path/to/a-share-macro-board` 请替换成本机项目目录；
 > systemd 部分使用 `%h`（用户主目录）以免写死绝对路径。
 
-## 1. cron（每天北京时间 08:30）
+## 1. cron（每天北京时间 15:01 与 20:30）
 
 服务器时区为 Asia/Shanghai 时：
 
 ```cron
-30 8 * * * cd /path/to/a-share-macro-board && set -a && . ./.env && set +a && .venv/bin/python update_data.py >> logs/update_data.log 2>&1
+1 15 * * * cd /path/to/a-share-macro-board && set -a && . ./.env && set +a && .venv/bin/python update_data.py >> logs/update_data.log 2>&1
+30 20 * * * cd /path/to/a-share-macro-board && set -a && . ./.env && set +a && .venv/bin/python update_data.py >> logs/update_data.log 2>&1
 ```
 
 服务器时区不是北京时间时，用 `CRON_TZ` 明确指定：
 
 ```cron
 CRON_TZ=Asia/Shanghai
-30 8 * * * cd /path/to/a-share-macro-board && set -a && . ./.env && set +a && .venv/bin/python update_data.py >> logs/update_data.log 2>&1
+1 15 * * * cd /path/to/a-share-macro-board && set -a && . ./.env && set +a && .venv/bin/python update_data.py >> logs/update_data.log 2>&1
+30 20 * * * cd /path/to/a-share-macro-board && set -a && . ./.env && set +a && .venv/bin/python update_data.py >> logs/update_data.log 2>&1
 ```
 
 注意：
@@ -40,6 +48,9 @@ CRON_TZ=Asia/Shanghai
 - cron 不加载交互式 shell 的变量，因此必须在命令行里 `set -a && . ./.env && set +a`。
 - `update_data.py` 在任一指标失败时返回退出码 1，便于 cron 邮件或其他监控捕获；
   失败不会影响页面，页面继续显示上一成功值并标注「更新失败」。
+- 单轮耗时含失败重试预算：国内源失败重试量级为秒级；现货黄金走海外链路（Cloudflare），
+  单独配了 5 次尝试 + `(8, 20)` 秒分离超时，**连接型失败最坏约 60 秒、读取型最坏约 120 秒**。
+  看到采集停在这一步一两分钟属正常重试，不是卡死；两次采集（15:01 / 20:30）互为兜底。
 - 首次部署需要先手动执行一次 `python update_data.py --full` 补齐历史。
 
 ## 2. systemd timer（等价方案）
@@ -61,10 +72,11 @@ ExecStart=%h/a-share-macro-board/.venv/bin/python update_data.py
 
 ```ini
 [Unit]
-Description=每天 08:30 (Asia/Shanghai) 采集
+Description=每天 15:01 与 20:30 (Asia/Shanghai) 采集
 
 [Timer]
-OnCalendar=Mon..Sun 08:30 Asia/Shanghai
+OnCalendar=Mon..Sun 15:01 Asia/Shanghai
+OnCalendar=Mon..Sun 20:30 Asia/Shanghai
 Persistent=true
 
 [Install]
@@ -118,6 +130,12 @@ systemctl --user restart macroboard-web.service                     # 重启页�
 systemctl --user start macroboard-update.service                    # 手动补采一次
 ```
 
+> **改完 Python 代码一定要 `restart macroboard-web.service`。**
+> Python 不会重新导入已加载的模块（`sys.modules` 缓存），Streamlit 也只重跑 `app.py`，
+> 而 `--server.fileWatcherType none` 关掉了自动重载。不重启的话页面会继续用
+> 服务启动那一刻的旧代码，且页面内部自洽、不报错——只是数值是旧口径的。
+> 完整说明与排查方法见 `deploy/README.md` 的「改完代码必须重启页面服务」。
+
 当前监听 `192.168.1.199`（只在本机网卡上监听）。注意 `192.168.1.0/24` 这类
 **CIDR 不能作为监听地址**：`--server.address` 只接受本机 IP，按来源网段过滤要用防火墙。
 三种取值与取舍见 `deploy/README.md`「局域网访问」；
@@ -127,5 +145,5 @@ systemctl --user start macroboard-update.service                    # 手动补�
 
 ```bash
 .venv/bin/python update_data.py --years 2 --only amount --only volume --only turnover_rate \
-  --only margin_net_buy --only limit_up_count --only limit_down_count
+  --only margin_net_buy --only margin_turnover --only limit_up_count --only limit_down_count
 ```
