@@ -117,6 +117,10 @@ class GoldSourceRetryBudgetTests(unittest.TestCase):
         self.assertEqual(kwargs['timeout'], gold_lbma.REQUEST_TIMEOUT)
         self.assertLess(kwargs['timeout'][0], 10.0)
         self.assertGreaterEqual(kwargs['attempts'], 5)
+        self.assertEqual(
+            kwargs['headers'],
+            {'Origin': gold_lbma.ORIGIN, 'Referer': gold_lbma.REFERER},
+        )
 
 
 if __name__ == '__main__':

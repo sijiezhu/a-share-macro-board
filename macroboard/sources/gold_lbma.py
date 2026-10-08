@@ -1,6 +1,6 @@
 """XAU/USD 现货黄金日度参考价（LBMA Gold Price PM 定盘价）。
 
-来源：LBMA 官方公开 JSON（https://prices.lbma.org.uk/json/gold_pm.json）。
+来源：LBMA 官方公开 JSON（https://prices.lbma.org.uk/json/limited/gold_pm.json）。
 口径：现货黄金定盘价，报价时点 15:00 伦敦时间（Europe/London），
 单位美元/金衡盎司（v[0] 为美元价）。非期货价。
 """
@@ -13,7 +13,9 @@ import requests
 
 from ..fetch import SourceError, get
 
-JSON_URL = 'https://prices.lbma.org.uk/json/gold_pm.json'
+JSON_URL = 'https://prices.lbma.org.uk/json/limited/gold_pm.json'
+REFERER = 'https://www.lbma.org.uk/'
+ORIGIN = 'https://www.lbma.org.uk'
 
 # 采集参数：LBMA 是本项目唯一走海外链路（Cloudflare）的数据源，晚间国际链路拥塞时
 # 会出现瞬时 ConnectTimeout（2026-09-27 20:30 那轮 16/17 成功、只有黄金失败，
@@ -56,6 +58,7 @@ def fetch(session: requests.Session, start: date, end: date) -> list[tuple[date,
     response = get(
         session,
         JSON_URL,
+        headers={'Origin': ORIGIN, 'Referer': REFERER},
         attempts=REQUEST_ATTEMPTS,
         backoff=REQUEST_BACKOFF,
         timeout=REQUEST_TIMEOUT,

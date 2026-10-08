@@ -23,15 +23,15 @@ def parse_daykline(text: str) -> list[tuple[date, float]]:
     start = text.find('("')
     if start == -1:
         raise SourceError('新浪日线响应格式异常')
-    body = text[start + 2 :].strip().strip(');\n\r ')
+    body = text[start + 2 :].rstrip('");\r\n\t ').lstrip('"\r\n\t ')
     out: list[tuple[date, float]] = []
     for chunk in body.split('|'):
         fields = chunk.split(',')
         if len(fields) < 5:
             continue
         try:
-            day = datetime.strptime(fields[0].strip(), '%Y-%m-%d').date()
-            close = float(fields[4])
+            day = datetime.strptime(fields[0].strip('"\r\n\t '), '%Y-%m-%d').date()
+            close = float(fields[4].strip('"\r\n\t '))
         except ValueError:
             continue
         out.append((day, close))

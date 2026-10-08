@@ -60,6 +60,12 @@ class FxTests(unittest.TestCase):
         rows = fx_usdcny.parse_daykline(self.TEXT)
         self.assertEqual(rows[-1], (date(2026, 9, 18), 6.6984))
 
+    def test_parse_daykline_handles_no_trailing_comma(self):
+        text = 'var _d=("2026-09-30,6.7050,6.7021,6.7091,6.7050,|2026-10-08,6.7035,6.7010,6.7054,6.7024");'
+        rows = fx_usdcny.parse_daykline(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1], (date(2026, 10, 8), 6.7024))
+
     def test_parse_daykline_rejects_other_payloads(self):
         with self.assertRaises(fx_usdcny.SourceError):
             fx_usdcny.parse_daykline('{"__ERROR":3}')

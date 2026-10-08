@@ -13,7 +13,7 @@
 | 美国10年期国债收益率 | 美国财政部 U.S. Department of the Treasury | `daily-treasury-rates.csv/{year}/all`，列 `10 Yr` | 无 | 1990 年至今（本项目回补近 5 年，约 1250 条） | % | 已接通并验证 |
 | 中债10年期国债收益率 | 中债收益率曲线，经东方财富数据中心镜像 | `datacenter.eastmoney.com/api/data/get`，报表 `RPTA_WEB_TREASURYYIELD`，字段 `EMM00166466` | 无 | 2015 年至今（本项目回补近 6 年，约 1500 条） | % | 已接通并验证（官网直连未接通） |
 | 美元兑人民币（在岸即期） | 新浪财经 在岸人民币行情 | `vip.stock.finance.sina.com.cn/forex/api/jsonp.php/.../NewForexService.getDayKLine?symbol=fx_susdcny`，取日线收盘 | 无 | 1994 年至今（本项目回补近 5 年，约 1280 条） | 人民币/美元 | 已接通并验证 |
-| 现货黄金参考价 XAU/USD | LBMA (London Bullion Market Association) | `prices.lbma.org.uk/json/gold_pm.json`，`v[0]` 为美元价 | 无 | 1968 年至今（本项目回补近 5 年，约 1250 条） | 美元/金衡盎司 | 已接通并验证 |
+| 现货黄金参考价 XAU/USD | LBMA (London Bullion Market Association) | `prices.lbma.org.uk/json/limited/gold_pm.json`，`v[0]` 为美元价 | 无 | 1968 年至今（本项目回补近 5 年，约 1250 条；增量取近期有限窗口） | 美元/金衡盎司 | 已接通并验证 |
 | 沪深A股上涨/下跌/平盘家数 | 东方财富妙想数据 | 妙想查询 `沪深A股上涨家数/下跌家数/平盘家数 {year}年1月1日至{year}年12月31日每个交易日`（沪深A股板块） | `MX_APIKEY` | 按自然年分段，本项目回补近 5 年（每个指标约 1210 条） | 家 | 已接通并验证 |
 | 沪深300指数收盘点位 | 东方财富妙想数据 | 妙想查询 `沪深300指数收盘价 {year}年1月1日至{year}年12月31日每个交易日`（`399300.SZ`） | `MX_APIKEY` | 按年回补，本项目取近 5 年（约 1210 条） | 点 | 已接通并验证 |
 | 沪深300 PE-TTM | 东方财富妙想数据 | 妙想查询 `沪深300指数市盈率PE-TTM {year}年1月1日至{year}年12月31日每个交易日` | `MX_APIKEY` | 供应商提供日度序列，本项目回补近 6 年（约 1450 条） | 倍 | 已接通并验证 |
